@@ -1,6 +1,7 @@
-/* Home Depot -> Marketplace Finder : content script
+/* Retail -> Marketplace Finder : content script
  *
- * Runs on Home Depot product pages (/p/*). Extracts the product, injects a
+ * Runs on retail product pages (Home Depot /p/*, Amazon /dp/*, Target /p/*,
+ * Walmart /ip/*). Extracts the product via a per-site adapter, injects a
  * sidebar, searches Facebook Marketplace (brand/model + category queries via
  * the background worker), then ranks results into Best / Similar / Related.
  */
@@ -14,7 +15,8 @@
   // Words that never help matching.
   const STOP = new Set([
     "with", "and", "in", "the", "for", "a", "an", "of", "to", "or",
-    "new", "home", "depot", "exclusive", "plus", "includes", "included",
+    "new", "home", "depot", "amazon", "target", "walmart",
+    "exclusive", "plus", "includes", "included",
     "set", "piece", "pieces", "pc", "pcs", "kit",
   ]);
   const UNITS = new Set([
@@ -57,6 +59,64 @@
 
   let SIGNALS = null; // analysis of the detected product, used for heuristic ranking
   let PRODUCT = null; // the detected product, for manual re-searches
+  let SITE = null;    // the adapter for the current retailer
+
+  // ---------------------------------------------------------------------------
+  // Site adapters
+  //
+  // Each retailer exposes the same product data through slightly different DOM
+  // and URL shapes. An adapter provides the site-specific bits; everything else
+  // (JSON-LD parsing, og:title, query building, ranking, UI) is shared.
+  //
+  //   name          human label, shown in the LLM prompt / sidebar sub-line
+  //   productRe     path pattern confirming this is a product (not listing) page
+  //   slugRe        captures the human-readable slug for a title-from-URL fallback
+  //   titleSelectors site-specific <h1> selectors, tried before og:title
+  //   brandSelectors optional DOM nodes carrying the brand when JSON-LD lacks it
+  //   modelFromSlug  true if the URL slug's last token is a usable model number
+  // ---------------------------------------------------------------------------
+  const SITES = {
+    "www.homedepot.com": {
+      name: "Home Depot",
+      productRe: /^\/p\//,
+      slugRe: /\/p\/([^/]+)\//,
+      titleSelectors: ["h1[data-testid]", "h1.product-details__title"],
+      brandSelectors: [],
+      modelFromSlug: true,
+    },
+    "www.amazon.com": {
+      name: "Amazon",
+      productRe: /\/(?:dp|gp\/product)\//,
+      slugRe: /\/([^/]+)\/dp\//,
+      titleSelectors: ["#productTitle", "h1#title", "#title"],
+      brandSelectors: ["#bylineInfo", "a#bylineInfo", "#brand"],
+      modelFromSlug: false,
+    },
+    "www.target.com": {
+      name: "Target",
+      productRe: /^\/p\//,
+      slugRe: /\/p\/([^/]+)\//,
+      titleSelectors: ['h1[data-test="product-title"]'],
+      brandSelectors: ['a[data-test="itemBrand"]', '[data-test="itemBrand"]'],
+      modelFromSlug: false,
+    },
+    "www.walmart.com": {
+      name: "Walmart",
+      productRe: /^\/ip\//,
+      slugRe: /\/ip\/([^/]+)\//,
+      titleSelectors: [
+        'h1[itemprop="name"]',
+        "#main-title",
+        'h1[data-testid="product-title"]',
+      ],
+      brandSelectors: ['a[data-testid="product-brand-link"]'],
+      modelFromSlug: false,
+    },
+  };
+
+  function detectSite() {
+    return SITES[location.hostname] || null;
+  }
 
   // ---------------------------------------------------------------------------
   // Tokenization
@@ -87,13 +147,19 @@
   // Product extraction
   // ---------------------------------------------------------------------------
 
-  function waitForProduct(timeoutMs = 12000, intervalMs = 400) {
+  // Poll until the product is detectable. `staleTitle` is the previous route's
+  // product: on an SPA navigation the old markup can linger, so a title equal
+  // to it means the new page hasn't rendered yet. We give up on that guard at
+  // the timeout so a genuinely identical title still resolves eventually.
+  function waitForProduct(staleTitle, timeoutMs = 12000, intervalMs = 400) {
     return new Promise((resolve) => {
       const started = Date.now();
       const tick = () => {
         const info = extractProduct();
-        if (info && info.title) return resolve(info);
-        if (Date.now() - started > timeoutMs) return resolve(info);
+        const expired = Date.now() - started > timeoutMs;
+        const stale = !expired && staleTitle && info && info.title === staleTitle;
+        if (info && info.title && !stale) return resolve(info);
+        if (expired) return resolve(info);
         setTimeout(tick, intervalMs);
       };
       tick();
@@ -101,8 +167,10 @@
   }
 
   function extractProduct() {
+    const site = SITE || {};
     const title =
-      textOf(document.querySelector("h1[data-testid], h1.product-details__title, h1")) ||
+      firstText(site.titleSelectors) ||
+      textOf(document.querySelector("h1")) ||
       metaContent("og:title") ||
       titleFromUrl();
 
@@ -119,7 +187,9 @@
       } catch {
         continue;
       }
-      const products = Array.isArray(data) ? data : [data];
+      // JSON-LD may be a single node, an array, or wrap nodes in an @graph.
+      const nodes = Array.isArray(data) ? data : [data];
+      const products = nodes.flatMap((n) => (n && Array.isArray(n["@graph"]) ? n["@graph"] : [n]));
       for (const p of products) {
         if (p && (p["@type"] === "Product" || p.name)) {
           brand = brand || (p.brand && (p.brand.name || p.brand));
@@ -132,6 +202,7 @@
       }
     }
 
+    if (!brand) brand = brandFromDom();
     if (!model) model = modelFromUrl();
 
     const info = {
@@ -140,6 +211,7 @@
       brand: brand || null,
       model: model || null,
       price: price || null,
+      site: (SITE && SITE.name) || null,
       url: location.href,
     };
     info.query = buildQuery(info);
@@ -225,14 +297,39 @@
     return String(t || "").replace(/\s+/g, " ").trim();
   }
   function titleFromUrl() {
-    const m = location.pathname.match(/\/p\/([^/]+)\//);
+    const re = (SITE && SITE.slugRe) || /\/p\/([^/]+)\//;
+    const m = location.pathname.match(re);
     return m ? decodeURIComponent(m[1]).replace(/-/g, " ") : null;
   }
   function modelFromUrl() {
-    const m = location.pathname.match(/\/p\/([^/]+)\//);
+    if (!SITE || !SITE.modelFromSlug) return null;
+    const m = location.pathname.match(SITE.slugRe);
     if (!m) return null;
     const last = m[1].split("-").pop();
     return /\d/.test(last) && /[A-Za-z]/.test(last) ? last : null;
+  }
+  // First non-empty text from a list of site-specific selectors.
+  function firstText(selectors) {
+    for (const sel of selectors || []) {
+      const t = textOf(document.querySelector(sel));
+      if (t) return t;
+    }
+    return null;
+  }
+  // Brand pulled from the page's brand element when JSON-LD doesn't carry it
+  // (common on Amazon). Strips the boilerplate retailers wrap it in.
+  function brandFromDom() {
+    const raw = firstText(SITE && SITE.brandSelectors);
+    return raw ? cleanBrand(raw) : null;
+  }
+  function cleanBrand(s) {
+    const b = String(s)
+      .replace(/^\s*(visit the|brand:|by)\s+/i, "")
+      .replace(/[’']s\s+store\s*$/i, "")
+      .replace(/\s+store\s*$/i, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    return b || null;
   }
   function metaContent(prop) {
     const el =
@@ -580,14 +677,65 @@
     a.target = "_blank";
     a.rel = "noopener";
     a.innerHTML = `
-      ${item.image ? `<img class="hd-mp-thumb" src="${escapeAttr(item.image)}" loading="lazy" />` : `<div class="hd-mp-thumb hd-mp-noimg"></div>`}
+      <div class="hd-mp-thumb hd-mp-noimg"></div>
       <div class="hd-mp-info">
         <div class="hd-mp-price">${escapeHtml(item.price || "—")}</div>
         <div class="hd-mp-name">${escapeHtml(item.title || "Listing")}</div>
         <div class="hd-mp-loc">${escapeHtml(item.location || "")}</div>
         ${item.reason ? `<div class="hd-mp-reason">${escapeHtml(item.reason)}</div>` : ""}
       </div>`;
+    if (item.image) loadThumb(a.querySelector(".hd-mp-thumb"), item.image);
     return a;
+  }
+
+  // Show a listing thumbnail, working around retailer CSP.
+  //
+  // Two-step: try the fbcdn URL directly first — that's free and works wherever
+  // the page's img-src allows fbcdn (e.g. Home Depot). If the load is refused,
+  // ask the background worker (not bound by page CSP) to fetch the bytes and
+  // hand them back inline as a data: URL.
+  // Set once the page's CSP is seen rejecting fbcdn, so the rest of the cards
+  // skip the doomed direct attempt (and the console noise that comes with it).
+  let directImagesBlocked = false;
+
+  function loadThumb(placeholder, url) {
+    if (directImagesBlocked) return proxyThumb(placeholder, url);
+    tryImage(url)
+      .then((img) => placeholder.replaceWith(img))
+      .catch(() => {
+        directImagesBlocked = true;
+        proxyThumb(placeholder, url);
+      });
+  }
+
+  function proxyThumb(placeholder, url) {
+    callBg({ type: "MP_IMAGE", url }, 15000)
+      .then((r) => {
+        if (!r || !r.ok || !r.dataUrl) {
+          console.warn("[MP][img] proxy failed:", (r && r.error) || "no data", url);
+          return;
+        }
+        return tryImage(r.dataUrl).then(
+          (img) => placeholder.replaceWith(img),
+          () => {
+            // Bytes arrived but the browser still won't render them: the page's
+            // CSP img-src is also rejecting data:. Nothing left to try.
+            console.warn("[MP][img] page CSP rejected the inlined data: image.", url);
+          }
+        );
+      })
+      .catch((e) => console.warn("[MP][img] proxy error:", (e && e.message) || e, url));
+  }
+
+  // Resolve with a loaded <img>, or reject if the browser refuses the source.
+  function tryImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.className = "hd-mp-thumb";
+      img.onload = () => resolve(img);
+      img.onerror = () => reject(new Error("image load refused"));
+      img.src = src;
+    });
   }
 
   function escapeHtml(s) {
@@ -596,13 +744,58 @@
       .replace(/</g, "&lt;")
       .replace(/>/g, "&gt;");
   }
-  function escapeAttr(s) {
-    return escapeHtml(s).replace(/"/g, "&quot;");
+
+  // ---------------------------------------------------------------------------
+  // Boot / SPA routing
+  //
+  // These retailers are SPAs: clicking a product from search swaps the page in
+  // via history.pushState without a document load, so Chrome never re-injects
+  // the content script. We therefore run on the whole site and drive the
+  // sidebar off URL changes ourselves.
+  // ---------------------------------------------------------------------------
+
+  let NAV = 0; // bumped on every route change; async work from a stale route bails
+
+  function teardown() {
+    for (const id of [PANEL_ID, TOGGLE_ID]) {
+      const el = document.getElementById(id);
+      if (el) el.remove();
+    }
+    SIGNALS = null;
+    PRODUCT = null;
   }
 
-  // ---------------------------------------------------------------------------
-  // Boot
-  // ---------------------------------------------------------------------------
+  async function onRoute() {
+    const nav = ++NAV;
+    SITE = detectSite();
+    const prevTitle = PRODUCT && PRODUCT.title;
+    teardown();
 
-  waitForProduct().then((product) => buildSidebar(product));
+    // Not a product page (search, category, cart, unknown host) — stay out.
+    if (!SITE || !SITE.productRe.test(location.pathname)) return;
+
+    // After a client-side nav the old product's markup can linger for a beat,
+    // so ignore a title identical to the one we just tore down.
+    const product = await waitForProduct(prevTitle);
+    if (nav !== NAV) return; // navigated again while we were waiting
+    buildSidebar(product);
+  }
+
+  // history.pushState can't be patched from a content script (isolated world:
+  // our globals aren't the page's), so poll the URL instead. It's cheap and
+  // catches every form of client-side navigation.
+  //
+  // Keyed on pathname, not href: the product's identity lives there, and
+  // rebuilding on every hash/query tweak (Target's "#lnk=sametab", Walmart's
+  // "?classType=VARIANT") would re-run the searches for no reason.
+  let lastPath = location.pathname;
+  function checkRoute() {
+    if (location.pathname === lastPath) return;
+    lastPath = location.pathname;
+    onRoute();
+  }
+  setInterval(checkRoute, 500);
+  window.addEventListener("popstate", checkRoute);
+
+  onRoute();
 })();

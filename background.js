@@ -1,7 +1,7 @@
-/* Home Depot -> Marketplace Finder : background service worker
+/* Retail -> Marketplace Finder : background service worker
  *
  * Fetches a Facebook Marketplace search page and best-effort parses the
- * listing data embedded in the HTML. Content scripts on homedepot.com can't
+ * listing data embedded in the HTML. Content scripts on a retailer's site can't
  * fetch facebook.com directly (CORS); the service worker can, thanks to
  * host_permissions, and it sends the user's Facebook cookies so results are
  * personalized to their login/location.
@@ -37,6 +37,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         console.error("[MP] search failed:", err);
         sendResponse({ ok: false, error: String((err && err.message) || err) });
       });
+    return true;
+  }
+
+  if (msg.type === "MP_IMAGE") {
+    fetchImageDataUrl(msg.url)
+      .then((dataUrl) => sendResponse({ ok: true, dataUrl }))
+      .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
   }
 
@@ -259,7 +266,7 @@ async function llmQueries(product, fallbackQueries) {
   if (!apiKey) return { ok: true, usedLLM: false, queries: fallbackQueries };
 
   const user =
-    "I'm shopping on Facebook Marketplace for a used or similar version of this Home Depot product:\n" +
+    `I'm shopping on Facebook Marketplace for a used or similar version of this ${product.site || "retail"} product:\n` +
     JSON.stringify(
       { title: product.title, brand: product.brand, model: product.model, price: product.price },
       null,
@@ -319,6 +326,58 @@ async function llmRank(product, listings) {
 
   console.log("[MP] LLM ranked", ranked.length, "of", listings.length, "(excluded", listings.length - ranked.length + ")");
   return { ok: true, usedLLM: true, ranked };
+}
+
+// Fetch a Marketplace thumbnail (fbcdn) and return it inline as a data: URL.
+// The content script can't load fbcdn images directly: the retailer page's CSP
+// governs the injected <img>, and sites like Walmart don't allow fbcdn in
+// img-src. The service worker isn't bound by the page CSP and has host
+// permission for *.fbcdn.net, so it fetches the bytes and inlines them.
+const IMAGE_TIMEOUT_MS = 10000;
+const IMAGE_MAX_BYTES = 3_000_000;
+
+async function fetchImageDataUrl(url) {
+  if (!/^https:\/\/[^/]+\.fbcdn\.net\//i.test(String(url || ""))) {
+    throw new Error("unsupported image host");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), IMAGE_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      credentials: "omit",
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      console.warn("[MP][img] fetch HTTP", res.status, url.slice(0, 120));
+      throw new Error("HTTP " + res.status);
+    }
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > IMAGE_MAX_BYTES) throw new Error("image too large");
+    const type = res.headers.get("content-type") || "image/jpeg";
+    const dataUrl = `data:${type};base64,${base64FromArrayBuffer(buf)}`;
+    console.log("[MP][img] ok", buf.byteLength, "bytes", type, "→", dataUrl.length, "chars");
+    return dataUrl;
+  } catch (e) {
+    if (e && e.name === "AbortError") throw new Error("image request timed out");
+    console.warn("[MP][img] fetch failed:", (e && e.message) || e, url.slice(0, 120));
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// btoa needs a binary string. Build it in modest chunks: passing a whole image's
+// bytes through String.fromCharCode.apply blows the argument limit (RangeError).
+function base64FromArrayBuffer(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = "";
+  const chunk = 0x2000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
 }
 
 async function searchMarketplace(query) {
@@ -415,7 +474,12 @@ async function fetchHtmlCapped(url) {
         if (markers > 0 && html.length - lastMarkerPos > MARKER_GAP) { stop = "block-end"; break; }
       }
     } finally {
-      try { await reader.cancel(); } catch { /* ignore */ }
+      // Facebook holds the socket open, so awaiting reader.cancel() on the live
+      // stream can hang forever — which would strand this call and surface as
+      // "no response from extension (timed out)" in the sidebar. Abort the
+      // request so cancellation resolves at once, and don't block on it.
+      try { controller.abort(); } catch { /* ignore */ }
+      reader.cancel().catch(() => { /* ignore */ });
     }
 
     return { ...meta, html, bytes: html.length, markers, stop };
