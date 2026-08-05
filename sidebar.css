@@ -1,0 +1,180 @@
+/* Home Depot -> Marketplace Finder : sidebar styles.
+ * Everything is namespaced under #hd-mp-* and uses high specificity + a large
+ * z-index so Home Depot's own CSS doesn't leak in or cover the panel. */
+
+#hd-mp-toggle {
+  position: fixed;
+  top: 120px;
+  right: 0;
+  z-index: 2147483646;
+  transform: translateX(0);
+  background: #1877f2;
+  color: #fff;
+  border: none;
+  border-radius: 8px 0 0 8px;
+  padding: 10px 12px;
+  font: 600 13px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  cursor: pointer;
+  box-shadow: -2px 2px 8px rgba(0, 0, 0, 0.2);
+}
+#hd-mp-toggle:hover { background: #166fe0; }
+
+#hd-mp-sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 360px;
+  max-width: 92vw;
+  height: 100vh;
+  z-index: 2147483647;
+  background: #f7f8fa;
+  box-shadow: -4px 0 16px rgba(0, 0, 0, 0.18);
+  transform: translateX(100%);
+  transition: transform 0.2s ease;
+  display: flex;
+  flex-direction: column;
+  font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: #1c1e21;
+  box-sizing: border-box;
+}
+#hd-mp-sidebar.hd-mp-open { transform: translateX(0); }
+
+#hd-mp-sidebar * { box-sizing: border-box; }
+
+#hd-mp-sidebar .hd-mp-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 14px;
+  background: #1877f2;
+  color: #fff;
+}
+#hd-mp-sidebar .hd-mp-title { font-weight: 700; font-size: 15px; }
+#hd-mp-sidebar .hd-mp-close {
+  background: transparent;
+  border: none;
+  color: #fff;
+  font-size: 22px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+#hd-mp-sidebar .hd-mp-sub {
+  padding: 8px 14px 0;
+  color: #606770;
+  font-size: 12px;
+}
+
+#hd-mp-sidebar .hd-mp-actions {
+  display: flex;
+  gap: 6px;
+  padding: 10px 14px 6px;
+}
+#hd-mp-sidebar .hd-mp-query {
+  flex: 1;
+  padding: 8px 10px;
+  border: 1px solid #ccd0d5;
+  border-radius: 6px;
+  font-size: 13px;
+  background: #fff;
+  color: #1c1e21;
+}
+#hd-mp-sidebar .hd-mp-search {
+  background: #1877f2;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#hd-mp-sidebar .hd-mp-search:hover { background: #166fe0; }
+
+#hd-mp-sidebar .hd-mp-openfb {
+  display: block;
+  padding: 0 14px 8px;
+  color: #1877f2;
+  font-size: 12px;
+  text-decoration: none;
+}
+#hd-mp-sidebar .hd-mp-openfb:hover { text-decoration: underline; }
+
+#hd-mp-sidebar .hd-mp-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px 24px;
+}
+
+#hd-mp-sidebar .hd-mp-status {
+  padding: 24px 12px;
+  color: #606770;
+  text-align: center;
+  font-size: 13px;
+}
+
+#hd-mp-sidebar .hd-mp-banner {
+  font-size: 12px;
+  color: #1877f2;
+  background: #e7f0fd;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 8px;
+  text-align: center;
+}
+
+#hd-mp-sidebar .hd-mp-group {
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: #606770;
+  padding: 12px 4px 6px;
+  position: sticky;
+  top: 0;
+  background: #f7f8fa;
+}
+#hd-mp-sidebar .hd-mp-group:first-child { padding-top: 2px; }
+#hd-mp-sidebar .hd-mp-group-exact { color: #1a7f37; }
+#hd-mp-sidebar .hd-mp-group-similar { color: #1877f2; }
+
+#hd-mp-sidebar .hd-mp-card {
+  display: flex;
+  gap: 10px;
+  padding: 8px;
+  margin-bottom: 8px;
+  background: #fff;
+  border: 1px solid #e4e6eb;
+  border-radius: 8px;
+  text-decoration: none;
+  color: inherit;
+}
+#hd-mp-sidebar .hd-mp-card:hover { border-color: #1877f2; }
+
+#hd-mp-sidebar .hd-mp-thumb {
+  width: 84px;
+  height: 84px;
+  object-fit: cover;
+  border-radius: 6px;
+  flex-shrink: 0;
+  background: #e4e6eb;
+}
+#hd-mp-sidebar .hd-mp-noimg { display: inline-block; }
+
+#hd-mp-sidebar .hd-mp-info { min-width: 0; }
+#hd-mp-sidebar .hd-mp-price { font-weight: 700; font-size: 15px; }
+#hd-mp-sidebar .hd-mp-name {
+  font-size: 13px;
+  color: #1c1e21;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+#hd-mp-sidebar .hd-mp-loc { font-size: 12px; color: #606770; margin-top: 2px; }
+#hd-mp-sidebar .hd-mp-reason {
+  font-size: 11px;
+  color: #1877f2;
+  margin-top: 3px;
+  font-style: italic;
+}
