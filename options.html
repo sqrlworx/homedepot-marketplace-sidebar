@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Marketplace Finder — Settings</title>
+    <style>
+      body {
+        font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        max-width: 560px;
+        margin: 40px auto;
+        padding: 0 20px;
+        color: #1c1e21;
+      }
+      h1 { font-size: 20px; }
+      label { display: block; font-weight: 600; margin: 18px 0 6px; }
+      input[type="password"], input[type="text"], select {
+        width: 100%;
+        padding: 9px 10px;
+        border: 1px solid #ccd0d5;
+        border-radius: 6px;
+        font-size: 14px;
+        box-sizing: border-box;
+      }
+      .hint { color: #606770; font-size: 12px; margin-top: 4px; }
+      button {
+        margin-top: 22px;
+        background: #1877f2;
+        color: #fff;
+        border: none;
+        border-radius: 6px;
+        padding: 10px 18px;
+        font-weight: 600;
+        font-size: 14px;
+        cursor: pointer;
+      }
+      button:hover { background: #166fe0; }
+      #status { margin-left: 12px; color: #1a7f37; font-weight: 600; }
+      .note {
+        background: #f0f2f5;
+        border-radius: 8px;
+        padding: 12px 14px;
+        margin-top: 24px;
+        font-size: 13px;
+        color: #444;
+      }
+      code { background: #e4e6eb; padding: 1px 5px; border-radius: 4px; }
+    </style>
+  </head>
+  <body>
+    <h1>Home Depot → Marketplace Finder</h1>
+    <p>
+      Add a Llama API key to get LLM-generated search queries and smarter result
+      ranking. Without a key, the extension falls back to keyword heuristics.
+    </p>
+
+    <label for="apiKey">Llama API key</label>
+    <input id="apiKey" type="password" placeholder="LLM|..." spellcheck="false" />
+    <div class="hint">
+      Stored only in this browser (<code>chrome.storage.local</code>) and sent
+      directly to <code>api.llama.com</code> from the extension. Get one at
+      llama.developer.meta.com.
+    </div>
+
+    <label for="model">Model</label>
+    <select id="model">
+      <option value="llama4-maverick-17b-128e-instruct">Llama 4 Maverick (best quality)</option>
+      <option value="llama4-scout-17b-16e-instruct">Llama 4 Scout (fastest / cheapest)</option>
+    </select>
+    <div class="hint">
+      This runs once or twice per product page. Scout is faster/cheaper if you
+      browse a lot; Maverick gives the best match judgments.
+      <button id="loadModels" type="button" style="background:#42596b;padding:4px 10px;margin-left:6px;font-size:12px">Load models for my key</button>
+    </div>
+
+    <div>
+      <button id="save" type="button">Save</button>
+      <button id="test" type="button" style="background:#42596b">Test connection</button>
+      <span id="status"></span>
+    </div>
+    <pre id="testResult" style="white-space:pre-wrap;background:#f0f2f5;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:12px;display:none"></pre>
+
+    <div class="note">
+      <b>Privacy:</b> when a key is set, the product title and the Marketplace
+      listing titles/prices/locations are sent to the Llama API (Meta) to build
+      queries and rank matches. No key → nothing leaves your browser except the
+      Facebook Marketplace search itself.
+    </div>
+
+    <script src="options.js"></script>
+  </body>
+</html>
