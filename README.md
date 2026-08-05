@@ -1,9 +1,20 @@
-# Home Depot → Marketplace Finder (Chrome extension)
+# Retail → Marketplace Finder (Chrome extension)
 
-When you open a Home Depot product page (e.g.
-`https://www.homedepot.com/p/...-TFB57PZB/311102891`), this extension detects the
+When you open a product page on a supported retailer, this extension detects the
 product, searches **Facebook Marketplace** for the same/similar item, and shows
 the results in a sidebar on the page.
+
+**Supported sites:**
+
+- Home Depot — `https://www.homedepot.com/p/...`
+- Amazon — `https://www.amazon.com/dp/...` (and `/gp/product/...`, `/<slug>/dp/...`)
+- Target — `https://www.target.com/p/...`
+- Walmart — `https://www.walmart.com/ip/...`
+
+Each site is handled by a small **adapter** in `content.js` (`SITES` registry)
+that supplies the site-specific `<h1>` selectors and URL shape; all the shared
+logic — JSON-LD / `og:title` extraction, query building, ranking, and the
+sidebar UI — works the same across every retailer.
 
 ## Install (unpacked)
 
@@ -12,8 +23,9 @@ the results in a sidebar on the page.
 3. Click **Load unpacked** and select this folder.
 4. **Log into Facebook** in the same browser profile (results use your login &
    location).
-5. Visit a Home Depot product page. A blue **Marketplace** tab appears on the
-   right — click it, or the sidebar opens automatically.
+5. Visit a product page on any supported site (Home Depot, Amazon, Target,
+   Walmart). A blue **Marketplace** tab appears on the right — click it, or the
+   sidebar opens automatically.
 
 ## Optional: LLM-powered queries & ranking
 
@@ -38,9 +50,12 @@ With no key, nothing leaves your browser except the Facebook Marketplace search.
 
 ## How it works
 
-- `content.js` runs on `homedepot.com/p/*`. It pulls the product name from the
-  `<h1>`, the `og:title` meta tag, JSON-LD `Product` schema, and the URL slug,
-  builds a search query, and injects the sidebar.
+- `content.js` runs on all pages of the supported retailers, but only activates
+  on product pages (each adapter's `productRe` guards the path). It picks the matching
+  **site adapter** (by hostname), pulls the product name from the site's `<h1>`
+  selectors, the `og:title` meta tag, JSON-LD `Product` schema (including
+  `@graph`-wrapped nodes), and the URL slug, builds a search query, and injects
+  the sidebar.
 - `background.js` (service worker) fetches the Marketplace search page. A content
   script on homedepot.com **can't** fetch facebook.com directly (CORS), but the
   service worker can via `host_permissions`, and it sends your Facebook cookies so
@@ -60,12 +75,21 @@ With no key, nothing leaves your browser except the Facebook Marketplace search.
 - Marketplace results are **location-based** (tied to your FB account).
 - This is a personal tool. Scraping may be against Facebook's Terms of Service —
   use it for your own browsing at your own discretion.
-- Home Depot is a React SPA; if you navigate between products without a full page
-  reload, refresh the page to re-run detection. (Adding SPA route-change
-  detection is a natural next enhancement.)
+- These retailers are React/SPA sites, so the content script is injected across
+  the whole domain and watches for client-side route changes itself (polling
+  `location.pathname` every 500 ms — `history.pushState` can't be patched from a
+  content script's isolated world). Navigating from search to a product, or
+  between products, rebuilds the sidebar without a reload.
+- Amazon rarely ships JSON-LD `Product` data, so brand comes from the byline
+  (`#bylineInfo`) and price/model may be blank — the title-based query still
+  works. Target/Walmart selectors (`data-test` / `data-testid` attributes) can
+  change; update the `SITES` registry in `content.js` if a title stops
+  detecting.
 
 ## Where to tweak things
 
+- Add/adjust a supported site: the `SITES` registry in `content.js` (and add the
+  host to `host_permissions` + a match pattern in `manifest.json`).
 - Query building / cleanup: `buildQuery()` in `content.js`.
 - Result parsing (the fragile part): `parseListings()` in `background.js`.
 - Number of results: `MAX_RESULTS` in `background.js`.
