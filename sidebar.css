@@ -39,6 +39,15 @@
 }
 #hd-mp-sidebar.hd-mp-open { transform: translateX(0); }
 
+/* When the sidebar is open, dock it along the right edge instead of covering the
+ * page: shrink the document by the panel's width so its content reflows to the
+ * left. The panel is fixed at right:0, so it sits exactly in the freed strip.
+ * Kept in sync with .hd-mp-open by togglePanel() in content.js. */
+html.hd-mp-docked {
+  margin-right: min(360px, 92vw) !important;
+  transition: margin-right 0.2s ease;
+}
+
 #hd-mp-sidebar * { box-sizing: border-box; }
 
 #hd-mp-sidebar .hd-mp-header {
