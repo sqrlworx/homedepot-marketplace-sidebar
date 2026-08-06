@@ -1,18 +1,10 @@
 {
   "manifest_version": 3,
-  "name": "Retail → Marketplace Finder",
-  "version": "0.2.0",
-  "description": "On a retail product page (Home Depot, Amazon, Target, Walmart), search Facebook Marketplace for the same or similar items and show results in a sidebar.",
+  "name": "Retail ↔ Marketplace Finder",
+  "version": "0.3.0",
+  "description": "On a retail product page, find the same item on Facebook Marketplace. On a Marketplace listing, identify the item from its photo and find it for sale new online.",
   "permissions": ["storage"],
-  "host_permissions": [
-    "https://www.homedepot.com/*",
-    "https://www.amazon.com/*",
-    "https://www.target.com/*",
-    "https://www.walmart.com/*",
-    "https://www.facebook.com/*",
-    "https://*.fbcdn.net/*",
-    "https://api.llama.com/*"
-  ],
+  "host_permissions": ["https://*/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -30,7 +22,8 @@
         "https://www.homedepot.com/*",
         "https://www.amazon.com/*",
         "https://www.target.com/*",
-        "https://www.walmart.com/*"
+        "https://www.walmart.com/*",
+        "https://www.facebook.com/marketplace/*"
       ],
       "js": ["content.js"],
       "css": ["sidebar.css"],

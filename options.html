@@ -47,10 +47,12 @@
     </style>
   </head>
   <body>
-    <h1>Retail → Marketplace Finder</h1>
+    <h1>Retail ↔ Marketplace Finder</h1>
     <p>
       Add a Llama API key to get LLM-generated search queries and smarter result
-      ranking. Without a key, the extension falls back to keyword heuristics.
+      ranking. On a Marketplace listing the key is what lets the extension
+      identify the item <em>from its photo</em> — without one, that direction can
+      only search the seller's raw title.
     </p>
 
     <label for="apiKey">Llama API key</label>
@@ -80,10 +82,12 @@
     <pre id="testResult" style="white-space:pre-wrap;background:#f0f2f5;border-radius:8px;padding:10px 12px;margin-top:12px;font-size:12px;display:none"></pre>
 
     <div class="note">
-      <b>Privacy:</b> when a key is set, the product title and the Marketplace
-      listing titles/prices/locations are sent to the Llama API (Meta) to build
-      queries and rank matches. No key → nothing leaves your browser except the
-      Facebook Marketplace search itself.
+      <b>Privacy:</b> when a key is set, product and listing text
+      (titles/prices/locations, and a Marketplace listing's description) is sent
+      to the Llama API (Meta) to build queries and rank matches. On a Marketplace
+      listing, <b>the listing's photo is uploaded too</b> so the item can be
+      identified from it. No key → nothing leaves your browser except the store
+      and Marketplace searches themselves.
     </div>
 
     <script src="options.js"></script>
