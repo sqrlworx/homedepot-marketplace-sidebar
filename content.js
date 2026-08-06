@@ -1,9 +1,18 @@
-/* Retail -> Marketplace Finder : content script
+/* Retail <-> Marketplace Finder : content script
  *
- * Runs on retail product pages (Home Depot /p/*, Amazon /dp/*, Target /p/*,
- * Walmart /ip/*). Extracts the product via a per-site adapter, injects a
- * sidebar, searches Facebook Marketplace (brand/model + category queries via
- * the background worker), then ranks results into Best / Similar / Related.
+ * Runs in two directions, picked by hostname:
+ *
+ *   retail mode      — on retail product pages (Home Depot /p/*, Amazon /dp/*,
+ *                      Target /p/*, Walmart /ip/*). Extracts the product via a
+ *                      per-site adapter and searches Facebook Marketplace for
+ *                      the same or a similar item, ranked Best/Similar/Related.
+ *
+ *   marketplace mode — on a Facebook Marketplace listing
+ *                      (/marketplace/item/<id>). Extracts the listing including
+ *                      its photo, has the background worker identify the actual
+ *                      product, then prices it at online stores: one card for
+ *                      the item itself with a link + price per store, followed
+ *                      by similar and related items.
  */
 
 (() => {
@@ -60,6 +69,10 @@
   let SIGNALS = null; // analysis of the detected product, used for heuristic ranking
   let PRODUCT = null; // the detected product, for manual re-searches
   let SITE = null;    // the adapter for the current retailer
+  let MODE = null;    // "retail" | "marketplace"
+  let LISTING = null; // the Marketplace listing, in marketplace mode
+
+  const MP_ITEM_RE = /^\/marketplace\/item\/(\d+)/;
 
   // ---------------------------------------------------------------------------
   // Site adapters
@@ -467,7 +480,9 @@
     panel.classList.toggle("hd-mp-open", open);
     // Dock/undock the page so the open panel sits along the right edge rather
     // than covering the content (see html.hd-mp-docked in sidebar.css).
-    document.documentElement.classList.toggle("hd-mp-docked", open);
+    // Facebook is laid out from full-viewport fixed elements, so shrinking the
+    // document doesn't reflow it — there the panel just overlays instead.
+    document.documentElement.classList.toggle("hd-mp-docked", open && MODE === "retail");
   }
 
   function setStatus(panel, msg) {
@@ -679,51 +694,63 @@
     const a = document.createElement("a");
     a.className = "hd-mp-card";
     a.href = item.url;
-    a.target = "_blank";
-    a.rel = "noopener";
     a.innerHTML = `
       <div class="hd-mp-thumb hd-mp-noimg"></div>
       <div class="hd-mp-info">
         <div class="hd-mp-price">${escapeHtml(item.price || "—")}</div>
         <div class="hd-mp-name">${escapeHtml(item.title || "Listing")}</div>
-        <div class="hd-mp-loc">${escapeHtml(item.location || "")}</div>
+        <div class="hd-mp-loc">${escapeHtml(item.location || item.shopName || "")}</div>
         ${item.reason ? `<div class="hd-mp-reason">${escapeHtml(item.reason)}</div>` : ""}
       </div>`;
-    // Open the listing ourselves instead of leaning on the native target=_blank.
-    // Some retailers (Target) run a document-level click interceptor that forces
-    // link clicks into the same tab (its "#lnk=sametab" rewrite), which swallows
-    // the anchor's new-tab default. Handling the click in the capture phase — and
-    // stopping it immediately — runs before that page listener can hijack it, so
-    // the listing reliably opens in a new tab everywhere.
-    a.addEventListener(
-      "click",
-      (e) => {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        window.open(item.url, "_blank", "noopener");
-      },
-      true
-    );
+    openInNewTab(a, item.url);
     if (item.image) loadThumb(a.querySelector(".hd-mp-thumb"), item.image);
     return a;
   }
 
-  // Show a listing thumbnail, working around retailer CSP.
+  // Open the target ourselves instead of leaning on the native target=_blank.
+  // Some hosts (Target, and Facebook's own SPA router) run a document-level
+  // click interceptor that forces link clicks into the same tab, which swallows
+  // the anchor's new-tab default. Handling the click in the capture phase — and
+  // stopping it immediately — runs before that page listener can hijack it, so
+  // the link reliably opens in a new tab everywhere.
+  function openInNewTab(anchor, url) {
+    anchor.target = "_blank";
+    anchor.rel = "noopener";
+    anchor.addEventListener(
+      "click",
+      (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        window.open(url, "_blank", "noopener");
+      },
+      true
+    );
+  }
+
+  // Show a thumbnail, working around the host page's CSP.
   //
-  // Two-step: try the fbcdn URL directly first — that's free and works wherever
-  // the page's img-src allows fbcdn (e.g. Home Depot). If the load is refused,
-  // ask the background worker (not bound by page CSP) to fetch the bytes and
-  // hand them back inline as a data: URL.
-  // Set once the page's CSP is seen rejecting fbcdn, so the rest of the cards
-  // skip the doomed direct attempt (and the console noise that comes with it).
-  let directImagesBlocked = false;
+  // Two-step: try the image URL directly first — that's free and works wherever
+  // the page's img-src allows that host (fbcdn on Home Depot, fbcdn on Facebook
+  // itself). If the load is refused, ask the background worker (not bound by
+  // page CSP) to fetch the bytes and hand them back inline as a data: URL.
+  //
+  // Tracked per image host, not globally: on Facebook the listing's own fbcdn
+  // photo loads fine while retailer CDNs are refused, so one blocked host
+  // shouldn't push everything through the proxy.
+  const blockedImageHosts = new Set();
 
   function loadThumb(placeholder, url) {
-    if (directImagesBlocked) return proxyThumb(placeholder, url);
+    let host = "";
+    try {
+      host = new URL(url).hostname;
+    } catch {
+      /* leave blank; it just won't be cached as blocked */
+    }
+    if (blockedImageHosts.has(host)) return proxyThumb(placeholder, url);
     tryImage(url)
       .then((img) => placeholder.replaceWith(img))
       .catch(() => {
-        directImagesBlocked = true;
+        if (host) blockedImageHosts.add(host);
         proxyThumb(placeholder, url);
       });
   }
@@ -766,6 +793,681 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Marketplace mode: listing extraction
+  //
+  // Two page shapes serve the same URL. Opening /marketplace/item/<id> directly
+  // renders the listing into role="main". Clicking a result from the feed or
+  // search instead layers the listing over the results as a full-screen
+  // role="dialog" — and the results grid *stays* in role="main" behind it. So
+  // everything here reads from listingRoot(), which prefers that overlay;
+  // reading role="main" would describe whatever the user was browsing before.
+  //
+  // Facebook also embeds listing JSON in inline scripts, which we use to fill in
+  // what the DOM doesn't expose (the description is collapsed behind "See
+  // more"). That JSON is only trustworthy when it mentions the id we're actually
+  // on: a search page's scripts carry dozens of other listings.
+  // ---------------------------------------------------------------------------
+
+  // How long a client-side navigation gets to mount the listing overlay before
+  // we give up and read role="main" instead.
+  const DIALOG_WAIT_MS = 3000;
+
+  function largestDialog() {
+    let best = null;
+    let bestArea = 0;
+    for (const d of document.querySelectorAll('div[role="dialog"]')) {
+      const r = d.getBoundingClientRect();
+      const area = r.width * r.height;
+      if (area > bestArea) {
+        bestArea = area;
+        best = d;
+      }
+    }
+    // Menus, tooltips and toasts are dialogs too; the listing overlay is big.
+    const viewport = window.innerWidth * window.innerHeight;
+    return best && bestArea > viewport * 0.25 ? best : null;
+  }
+
+  // `requireDialog` is set while we're still waiting for a client-side
+  // navigation to mount the overlay, so we don't read the page underneath it.
+  function listingRoot(requireDialog) {
+    const dialog = largestDialog();
+    if (dialog) return dialog;
+    if (requireDialog) return null;
+    return document.querySelector('div[role="main"]') || document.body;
+  }
+
+  const TITLE_CHROME =
+    /^(?:marketplace|facebook|search|search results|notifications|menu|filters|categories|today's picks|browse all)$/i;
+
+  function plausibleTitle(t) {
+    return !!t && t.length >= 3 && t.length <= 250 && !TITLE_CHROME.test(t);
+  }
+
+  function listingTitleFromDom(requireDialog) {
+    const root = listingRoot(requireDialog);
+    if (!root) return null;
+
+    const h1 = cleanTitle(textOf(root.querySelector("h1")));
+    if (plausibleTitle(h1)) return h1;
+
+    // Facebook often marks the title with role="heading" rather than a real
+    // heading tag. The listing title is the first one inside the overlay.
+    for (const el of root.querySelectorAll('[role="heading"]')) {
+      const t = cleanTitle(textOf(el));
+      if (plausibleTitle(t)) return t;
+    }
+
+    return titleFromDocumentTitle();
+  }
+
+  function titleFromDocumentTitle() {
+    const t = cleanTitle(document.title)
+      .replace(/\s*[|·]\s*Facebook\s*$/i, "")
+      .replace(/\s*[-–—]\s*Marketplace\s*$/i, "")
+      .replace(/^\s*Marketplace\s*[-–—|]\s*/i, "");
+    return plausibleTitle(t) ? t : null;
+  }
+
+  function extractListing(requireDialog) {
+    const m = location.pathname.match(MP_ITEM_RE);
+    if (!m) return null;
+    const id = m[1];
+
+    const root = listingRoot(requireDialog);
+    if (!root) return null;
+
+    const embedded = embeddedListing(id);
+    const title = listingTitleFromDom(requireDialog) || embedded.title;
+    if (!title) return null;
+
+    return {
+      id,
+      title: cleanTitle(title),
+      price: listingPriceFromDom(root) || embedded.price || null,
+      image: listingPhotoFromDom(root) || embedded.image || null,
+      description: embedded.description || null,
+      location: embedded.location || null,
+      condition: embedded.condition || null,
+      url: location.href,
+    };
+  }
+
+  // The listing's own photo: the largest fbcdn image in the listing view.
+  // Seller avatars and UI glyphs are also fbcdn-hosted, so require a real size.
+  function listingPhotoFromDom(root) {
+    let best = null;
+    let bestArea = 0;
+    for (const img of root.querySelectorAll('img[src*="fbcdn"]')) {
+      const r = img.getBoundingClientRect();
+      if (r.width < 120 || r.height < 120) continue;
+      const area = r.width * r.height;
+      if (area > bestArea) {
+        bestArea = area;
+        best = img;
+      }
+    }
+    return best ? best.currentSrc || best.src : null;
+  }
+
+  // First price in the listing view. The item's own price sits at the top,
+  // above the "more like this" rail's prices.
+  function listingPriceFromDom(root) {
+    for (const el of root.querySelectorAll("span, div, h2")) {
+      if (el.children.length) continue; // leaf nodes only, so we get the price alone
+      const t = el.textContent.trim();
+      if (/^\$[\d,]+(?:\.\d{2})?$/.test(t) || /^free$/i.test(t)) return t;
+    }
+    return null;
+  }
+
+  function embeddedListing(id) {
+    // `id` came out of the pathname via \d+, so it's safe to build a regex from.
+    // Inside inline JSON, Facebook escapes the permalink's slashes as "\/", so
+    // allow an optional backslash before each.
+    const s0 = "\\\\?/";
+    const anchor = new RegExp('"id":"' + id + '"|marketplace' + s0 + "item" + s0 + id);
+    for (const s of document.querySelectorAll("script")) {
+      const t = s.textContent;
+      if (!t || t.indexOf(id) === -1) continue;
+      const at = t.search(anchor);
+      if (at === -1) continue;
+
+      const scope = listingObjectAround(t, at);
+      if (!scope) continue;
+
+      const field = (re) => {
+        const m = scope.match(re);
+        return m ? unescapeJsonString(m[1]) : null;
+      };
+      return {
+        title: field(/"marketplace_listing_title":"((?:\\.|[^"\\])*)"/),
+        price:
+          field(/"formatted_amount_zeros_stripped":"((?:\\.|[^"\\])*)"/) ||
+          field(/"formatted_amount":"((?:\\.|[^"\\])*)"/),
+        description: field(/"redacted_description":\{"text":"((?:\\.|[^"\\])*)"/),
+        image: field(/"primary_listing_photo":[\s\S]{0,600}?"uri":"((?:\\.|[^"\\])*)"/),
+        location: field(/"reverse_geocode":\{[^}]*?"city":"((?:\\.|[^"\\])*)"/),
+        condition: field(/"condition":"((?:\\.|[^"\\])*)"/),
+      };
+    }
+    // Nothing in the inline scripts mentions this listing — it arrived over XHR
+    // after a client-side navigation. The DOM is the only source.
+    return {};
+  }
+
+  // Isolate the JSON object for the listing at `at`.
+  //
+  // A search payload holds dozens of listings back to back, so a plain "nearest
+  // match" picks up a neighbour's fields — the listing before this one ends
+  // closer to our anchor than this one's own description begins. Walking out to
+  // the enclosing object and reading only inside it is the only way to keep one
+  // listing's fields together. (background.js does the same for search results.)
+  function listingObjectAround(text, at) {
+    const min = Math.max(0, at - 12000);
+    for (let i = at; i >= min; i--) {
+      if (text[i] !== "{") continue;
+      const obj = balancedObject(text, i, at + 40000);
+      if (!obj) continue;
+      if (i + obj.length <= at) continue; // closes before our anchor
+      if (obj.indexOf('"marketplace_listing_title"') === -1) continue;
+      return obj;
+    }
+    return null;
+  }
+
+  // The balanced-brace substring starting at `openIdx`, ignoring braces and
+  // quotes inside JSON string values. null if it doesn't close within `max`.
+  function balancedObject(str, openIdx, max) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    const end = Math.min(str.length, max);
+    for (let i = openIdx; i < end; i++) {
+      const c = str[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+      } else if (c === '"') {
+        inStr = true;
+      } else if (c === "{") {
+        depth++;
+      } else if (c === "}") {
+        if (--depth === 0) return str.slice(openIdx, i + 1);
+      }
+    }
+    return null;
+  }
+
+  function unescapeJsonString(s) {
+    try {
+      return JSON.parse('"' + s.replace(/"/g, '\\"') + '"');
+    } catch {
+      return s.replace(/\\\//g, "/").replace(/\\u002F/gi, "/");
+    }
+  }
+
+  // Resolve once the listing view is up and showing something other than the
+  // listing we just tore down. `spaNav` means we got here by a client-side
+  // navigation, so the overlay may not have mounted yet.
+  function waitForListing(staleTitle, spaNav, timeoutMs = 15000, intervalMs = 300) {
+    return new Promise((resolve) => {
+      const started = Date.now();
+      const dialogDeadline = started + (spaNav ? DIALOG_WAIT_MS : 0);
+      const tick = () => {
+        const requireDialog = Date.now() < dialogDeadline;
+        const t = listingTitleFromDom(requireDialog);
+        const expired = Date.now() - started > timeoutMs;
+        const stale = !expired && staleTitle && t === staleTitle;
+        if ((t && !stale) || expired) return resolve(extractListing(false));
+        setTimeout(tick, intervalMs);
+      };
+      tick();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Marketplace mode: find the item for sale online
+  // ---------------------------------------------------------------------------
+
+  function buildMarketplaceSidebar(listing) {
+    if (document.getElementById(PANEL_ID)) return;
+    LISTING = listing;
+
+    const toggle = document.createElement("button");
+    toggle.id = TOGGLE_ID;
+    toggle.type = "button";
+    toggle.title = "Toggle online prices";
+    toggle.textContent = "Buy new";
+    document.body.appendChild(toggle);
+
+    const panel = document.createElement("div");
+    panel.id = PANEL_ID;
+    panel.className = "hd-mp-open hd-mp-shop";
+    panel.innerHTML = `
+      <div class="hd-mp-header">
+        <div class="hd-mp-title">Buy it new online</div>
+        <button class="hd-mp-close" type="button" aria-label="Close">×</button>
+      </div>
+      <div class="hd-mp-sub"></div>
+      <div class="hd-mp-actions">
+        <input class="hd-mp-query" type="text" spellcheck="false" placeholder="Identifying item…" />
+        <button class="hd-mp-search" type="button">Search</button>
+      </div>
+      <div class="hd-mp-body"><div class="hd-mp-status">Identifying this item…</div></div>
+    `;
+    document.body.appendChild(panel);
+
+    panel.querySelector(".hd-mp-sub").textContent = `Listed as: ${listing.title}`;
+
+    const input = panel.querySelector(".hd-mp-query");
+    toggle.addEventListener("click", () => togglePanel(panel));
+    panel.querySelector(".hd-mp-close").addEventListener("click", () => togglePanel(panel, false));
+    panel.querySelector(".hd-mp-search").addEventListener("click", () => runShopSearch(panel, input.value));
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") runShopSearch(panel, input.value);
+    });
+
+    runShopFlow(panel, listing);
+  }
+
+  let IDENTIFIED = null; // the product the LLM recognized, reused by manual searches
+  let CORRECTION = null; // set when verification overrode the first identification
+
+  async function runShopFlow(panel, listing) {
+    const nav = NAV;
+    setStatus(panel, listing.image ? "Identifying this item from its photo…" : "Identifying this item…");
+
+    let ident;
+    try {
+      ident = await callBg({ type: "MP_IDENTIFY", listing }, 90000);
+    } catch (e) {
+      return renderShopError(panel, (e && e.message) || String(e));
+    }
+    if (nav !== NAV) return;
+    if (!ident || !ident.ok) return renderShopError(panel, ident && ident.error);
+
+    IDENTIFIED = ident.product;
+    const queries = ident.queries || {};
+    panel.querySelector(".hd-mp-query").value = queries.exact || "";
+    if (IDENTIFIED.name) {
+      panel.querySelector(".hd-mp-sub").textContent = ident.usedLLM
+        ? `Identified as: ${IDENTIFIED.name}`
+        : `Listed as: ${IDENTIFIED.name}`;
+    }
+
+    await shopFor(panel, nav, IDENTIFIED, queries);
+  }
+
+  // Manual re-search: the user edited the query, so search on that alone.
+  function runShopSearch(panel, query) {
+    query = (query || "").trim();
+    if (!query) return setStatus(panel, "Enter a search term.");
+    const product = IDENTIFIED || { name: query, brand: "", model: "", category: "" };
+    shopFor(panel, NAV, product, { exact: query });
+  }
+
+  async function shopFor(panel, nav, product, queries) {
+    CORRECTION = null;
+    setStatus(panel, `Searching the web and stores for “${queries.exact}”…`);
+
+    // Only the exact-item query goes to the open web. A category query ("gas
+    // grill") returns buying guides and listicles, whereas the fixed store
+    // searches genuinely do return comparable products for it.
+    const searches = [{ q: queries.exact, web: true }];
+    if (queries.category && queries.category !== queries.exact) {
+      searches.push({ q: queries.category, web: false });
+    }
+
+    const t = Date.now();
+    const rounds = await Promise.all(
+      searches.map((s) => shopRound(s.q, s.web ? product.brandDomain : null, s.web))
+    );
+    if (nav !== NAV) return;
+    console.log(`[MP][shop] discovery: ${Date.now() - t}ms`);
+
+    // The first (most specific) round decides which stores we offer plain
+    // search links for when nothing parsed out.
+    let shops = (rounds[0] && rounds[0].shops) || [];
+    const offers = [];
+    const seen = new Set();
+    const add = (o) => {
+      const key = o.shop + ":" + o.id;
+      if (seen.has(key)) return;
+      seen.add(key);
+      offers.push(o);
+    };
+    for (const round of rounds) {
+      for (const shop of round.shops) for (const o of shop.offers) add(o);
+      for (const o of round.web) add(o);
+    }
+
+    // A hallucinated model name is the failure mode that hurts most: the search
+    // still returns plenty of results, they're just all the wrong product (ask
+    // for an "IKEA Kivik wing chair" and you get KIVIK sofas). Retry without the
+    // model when nothing we found backs it up, so the evidence the verification
+    // pass reasons over actually contains the real item.
+    if (queries.fallback && queries.fallback !== queries.exact && !corroborates(product, offers)) {
+      console.log(`[MP][shop] "${queries.exact}" unsupported by results — retrying "${queries.fallback}"`);
+      const extra = await shopRound(queries.fallback, product.brandDomain, true);
+      if (nav !== NAV) return;
+      for (const shop of extra.shops) for (const o of shop.offers) add(o);
+      for (const o of extra.web) add(o);
+      if (!shops.length) shops = extra.shops;
+    }
+
+    if (!offers.length && !shops.length) {
+      return renderShopError(panel, null, "Nothing responded", "Try the Search button again.");
+    }
+    if (!offers.length) return renderShop(panel, product, [], [], [], shops);
+
+    // Show a heuristic pass immediately; the graded results replace it later.
+    // The scored order also decides what the verifier and matcher see first —
+    // both read only so many offers, and they should be the plausible ones.
+    let scored = scoreOffers(product, offers);
+    renderShop(panel, product, ...bucketArgs(splitBuckets(scored)), shops, "Checking against real listings…");
+
+    // Re-identify against what we actually found before grading anything, so a
+    // wrong name can't quietly define what counts as a match.
+    const checked = await verifyIdentity(product, scored);
+    if (nav !== NAV) return;
+    let verifiedOffer = null;
+    if (checked) {
+      // Resolve the ref against the list the verifier actually saw, before any
+      // re-scoring below reorders it.
+      verifiedOffer = offerByRef(scored, checked.matchRef);
+      product = checked.product;
+      if (checked.changed) {
+        console.log("[MP][shop] identification corrected:", checked.note);
+        IDENTIFIED = product;
+        panel.querySelector(".hd-mp-query").value = product.name || "";
+        panel.querySelector(".hd-mp-sub").textContent = `Identified as: ${product.name}`;
+        CORRECTION = checked.note || "Corrected against store listings.";
+        scored = scoreOffers(product, offers);
+      }
+    }
+
+    const quick = splitBuckets(scored);
+    const matched = await matchOffers(product, scored);
+    if (nav !== NAV) return;
+    const final = matched || quick;
+    // The verifier looked at the photo alongside this page and said it's the
+    // same product; the bulk matcher only ever sees titles, so it doesn't get
+    // to overrule that.
+    if (verifiedOffer) promoteToExact(final, verifiedOffer);
+    renderShop(panel, product, ...bucketArgs(final), shops);
+  }
+
+  function bucketArgs(b) {
+    return [b.exact, b.similar, b.related];
+  }
+
+  function offerByRef(list, ref) {
+    if (ref == null || ref === "" || ref === "null") return null;
+    const i = Number(ref);
+    return Number.isInteger(i) && i >= 0 && i < list.length ? list[i] : null;
+  }
+
+  function promoteToExact(buckets, offer) {
+    const key = (o) => o.shop + ":" + o.id;
+    const k = key(offer);
+    if (buckets.exact.some((o) => key(o) === k)) return;
+    buckets.similar = buckets.similar.filter((o) => key(o) !== k);
+    buckets.related = buckets.related.filter((o) => key(o) !== k);
+    buckets.exact.unshift({ ...offer, bucket: "exact", reason: "matches the listing photo" });
+  }
+
+  async function verifyIdentity(product, offers) {
+    if (!offers.length) return null;
+    try {
+      const r = await callBg({ type: "MP_VERIFY", listing: LISTING, product, offers }, 90000);
+      if (r && r.ok && r.usedLLM && r.product) return r;
+    } catch (e) {
+      console.warn("[MP][shop] verify failed:", (e && e.message) || e);
+    }
+    return null;
+  }
+
+  // Does anything we found actually support the guessed model name?
+  //
+  // Checking the model alone isn't enough — searching for a model that belongs
+  // to a different product line still returns that line's pages, model name and
+  // all. What must co-occur in a single title is the model *and* the product
+  // type: "KIVIK Sofa" has the model but not "wing chair", so it fails, while
+  // "STRANDMON Wing chair" passes.
+  function corroborates(product, offers) {
+    const model = significantTokens(product.model).filter((t) => t.length > 2);
+    if (!model.length) return true; // no model claimed, nothing to disprove
+    const cat = significantTokens(product.category).filter((t) => t.length > 2);
+    return offers.some((o) => {
+      const t = String(o.title || "").toLowerCase();
+      return model.every((m) => t.includes(m)) && cat.every((c) => t.includes(c));
+    });
+  }
+
+  async function shopRound(query, brandDomain, web) {
+    try {
+      const r = await callBg({ type: "MP_SHOP", query, web: !!web, brandDomain }, 90000);
+      if (r && r.ok) return { shops: r.shops || [], web: r.web || [] };
+    } catch (e) {
+      console.warn("[MP][shop] round failed:", (e && e.message) || e);
+    }
+    return { shops: [], web: [] };
+  }
+
+  async function matchOffers(product, offers) {
+    try {
+      const r = await callBg({ type: "MP_MATCH", product, offers }, 90000);
+      if (r && r.ok && r.usedLLM && Array.isArray(r.matched)) return splitBuckets(r.matched);
+    } catch (e) {
+      console.warn("[MP][shop] match failed:", (e && e.message) || e);
+    }
+    return null;
+  }
+
+  function splitBuckets(items) {
+    const out = { exact: [], similar: [], related: [] };
+    for (const it of items) (out[it.bucket] || out.related).push(it);
+    out.similar = out.similar.slice(0, BUCKET_CAP.similar);
+    out.related = out.related.slice(0, BUCKET_CAP.related);
+    return out;
+  }
+
+  // Bucket offers by token overlap with the identified product, best first.
+  // Used before the LLM answers, and as the whole story when there's no API key.
+  function scoreOffers(product, offers) {
+    const core = dedupe(significantTokens([product.brand, product.model, product.name].join(" ")));
+    const brand = dedupe(significantTokens(product.brand));
+    const cat = dedupe(significantTokens(product.category));
+
+    const scored = offers.map((o) => {
+      const t = String(o.title || "").toLowerCase();
+      const hits = core.filter((k) => k.length > 1 && t.includes(k)).length;
+      const overlap = core.length ? hits / core.length : 0;
+      const brandMatch = brand.length > 0 && brand.every((b) => t.includes(b));
+      const catMatch = cat.length > 0 && cat.every((c) => t.includes(c));
+      let bucket;
+      if (overlap >= 0.6 || (brandMatch && overlap >= 0.4)) bucket = "exact";
+      else if (brandMatch || catMatch) bucket = "similar";
+      else bucket = "related";
+      return { ...o, bucket, score: overlap };
+    });
+
+    const rank = { exact: 0, similar: 1, related: 2 };
+    scored.sort((a, b) => rank[a.bucket] - rank[b.bucket] || b.score - a.score);
+    return scored;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Marketplace mode: rendering
+  // ---------------------------------------------------------------------------
+
+  const IDENTIFY_HINT =
+    "Identification uses the Llama API — add a key in the extension's options for " +
+    "photo-based matching, or type what this is in the box above.";
+
+  function renderShopError(panel, error, lead = "Couldn't identify this item", hint = IDENTIFY_HINT) {
+    panel.querySelector(".hd-mp-body").innerHTML = `
+      <div class="hd-mp-status">
+        ${escapeHtml(lead)}${error ? " (" + escapeHtml(error) + ")" : ""}.<br/><br/>
+        ${escapeHtml(hint)}
+      </div>`;
+  }
+
+  function renderShop(panel, product, exact, similar, related, shops, banner) {
+    const body = panel.querySelector(".hd-mp-body");
+    body.innerHTML = "";
+
+    if (banner) {
+      const b = document.createElement("div");
+      b.className = "hd-mp-banner";
+      b.textContent = banner;
+      body.appendChild(b);
+    }
+
+    body.appendChild(heroCard(product, exact, shops));
+
+    for (const [bucket, items] of [["similar", similar], ["related", related]]) {
+      if (!items.length) continue;
+      const h = document.createElement("div");
+      h.className = "hd-mp-group hd-mp-group-" + bucket;
+      h.textContent = `${BUCKET_LABEL[bucket]} (${items.length})`;
+      body.appendChild(h);
+      for (const it of items) body.appendChild(card(it));
+    }
+  }
+
+  // The one card for the item itself: what it is, what the seller wants for it,
+  // and what each store charges for a new one.
+  function heroCard(product, exact, shops) {
+    const wrap = document.createElement("div");
+    wrap.className = "hd-mp-hero";
+
+    const offers = bestPerStore(exact);
+    const cheapest = offers.map((o) => priceNumber(o.price)).filter((n) => n != null)[0];
+    const asking = priceNumber(LISTING && LISTING.price);
+
+    const missing = shops.filter((s) => !offers.some((o) => o.shop === s.key));
+    const subtitle = [product.brand, product.model].filter(Boolean).join(" · ");
+
+    wrap.innerHTML = `
+      <div class="hd-mp-hero-top">
+        <div class="hd-mp-thumb hd-mp-noimg"></div>
+        <div class="hd-mp-hero-id">
+          <div class="hd-mp-hero-name">${escapeHtml(product.name || (LISTING && LISTING.title) || "This item")}</div>
+          ${subtitle ? `<div class="hd-mp-hero-meta">${escapeHtml(subtitle)}</div>` : ""}
+          ${
+            LISTING && LISTING.price
+              ? `<div class="hd-mp-hero-asking">Marketplace: <b>${escapeHtml(LISTING.price)}</b></div>`
+              : ""
+          }
+          ${
+            CORRECTION
+              ? `<div class="hd-mp-hero-fix">Corrected from the first guess: ${escapeHtml(CORRECTION)}</div>`
+              : ""
+          }
+          ${
+            product.confidence === "low"
+              ? `<div class="hd-mp-hero-warn">Low confidence — edit the search above if this is wrong.</div>`
+              : ""
+          }
+        </div>
+      </div>
+      <div class="hd-mp-hero-offers"></div>
+    `;
+
+    const heroImage = (LISTING && LISTING.image) || (exact[0] && exact[0].image);
+    if (heroImage) loadThumb(wrap.querySelector(".hd-mp-thumb"), heroImage);
+
+    const list = wrap.querySelector(".hd-mp-hero-offers");
+    if (offers.length) {
+      const label = document.createElement("div");
+      label.className = "hd-mp-hero-label";
+      label.textContent = "Selling it new";
+      list.appendChild(label);
+      for (const o of offers) list.appendChild(offerRow(o));
+
+      if (asking != null && cheapest != null) {
+        const diff = document.createElement("div");
+        const delta = cheapest - asking;
+        diff.className = "hd-mp-hero-save " + (delta > 0 ? "hd-mp-save-good" : "hd-mp-save-bad");
+        diff.textContent =
+          delta > 0
+            ? `Saves $${fmt(delta)} vs. the cheapest new one.`
+            : `New is $${fmt(-delta)} cheaper than this listing.`;
+        list.appendChild(diff);
+      }
+    } else {
+      const none = document.createElement("div");
+      none.className = "hd-mp-hero-label";
+      none.textContent = missing.length
+        ? "No prices parsed — search the stores directly:"
+        : "No stores had a match.";
+      list.appendChild(none);
+    }
+
+    if (missing.length) {
+      const links = document.createElement("div");
+      links.className = "hd-mp-hero-links";
+      for (const s of missing) {
+        const a = document.createElement("a");
+        a.className = "hd-mp-chip";
+        a.href = s.searchUrl;
+        a.textContent = s.name + " ↗";
+        if (s.error) a.title = s.name + ": " + s.error;
+        openInNewTab(a, s.searchUrl);
+        links.appendChild(a);
+      }
+      list.appendChild(links);
+    }
+
+    return wrap;
+  }
+
+  function offerRow(offer) {
+    const a = document.createElement("a");
+    a.className = "hd-mp-offer";
+    a.href = offer.url;
+    a.innerHTML = `
+      <span class="hd-mp-offer-store">${escapeHtml(offer.shopName)}</span>
+      <span class="hd-mp-offer-title">${escapeHtml(offer.title || "")}</span>
+      <span class="hd-mp-offer-price">${escapeHtml(offer.price || "See price")}</span>`;
+    openInNewTab(a, offer.url);
+    return a;
+  }
+
+  function bestPerStore(offers) {
+    const by = new Map();
+    for (const o of offers) {
+      const cur = by.get(o.shop);
+      if (!cur) {
+        by.set(o.shop, o);
+        continue;
+      }
+      const n = priceNumber(o.price);
+      const c = priceNumber(cur.price);
+      if (n != null && (c == null || n < c)) by.set(o.shop, o);
+    }
+    return [...by.values()].sort((a, b) => {
+      const an = priceNumber(a.price);
+      const bn = priceNumber(b.price);
+      if (an == null) return bn == null ? 0 : 1;
+      if (bn == null) return -1;
+      return an - bn;
+    });
+  }
+
+  function priceNumber(p) {
+    const m = String(p == null ? "" : p).match(/([\d,]+(?:\.\d{2})?)/);
+    return m ? Number(m[1].replace(/,/g, "")) : null;
+  }
+
+  function fmt(n) {
+    return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  }
+
+  // ---------------------------------------------------------------------------
   // Boot / SPA routing
   //
   // These retailers are SPAs: clicking a product from search swaps the page in
@@ -785,21 +1487,36 @@
     document.documentElement.classList.remove("hd-mp-docked");
     SIGNALS = null;
     PRODUCT = null;
+    LISTING = null;
+    IDENTIFIED = null;
+    CORRECTION = null;
+    MODE = null;
   }
 
-  async function onRoute() {
+  async function onRoute(spaNav) {
     const nav = ++NAV;
-    SITE = detectSite();
-    const prevTitle = PRODUCT && PRODUCT.title;
+    // After a client-side nav the old page's markup can linger for a beat, so
+    // ignore a title identical to the one we just tore down.
+    const prevTitle = (PRODUCT && PRODUCT.title) || (LISTING && LISTING.title);
     teardown();
 
+    if (location.hostname === "www.facebook.com") {
+      // Marketplace search/category/inbox pages — stay out.
+      if (!MP_ITEM_RE.test(location.pathname)) return;
+      MODE = "marketplace";
+      const listing = await waitForListing(prevTitle, spaNav);
+      if (nav !== NAV) return; // navigated again while we were waiting
+      if (!listing) return;
+      return buildMarketplaceSidebar(listing);
+    }
+
+    SITE = detectSite();
     // Not a product page (search, category, cart, unknown host) — stay out.
     if (!SITE || !SITE.productRe.test(location.pathname)) return;
 
-    // After a client-side nav the old product's markup can linger for a beat,
-    // so ignore a title identical to the one we just tore down.
+    MODE = "retail";
     const product = await waitForProduct(prevTitle);
-    if (nav !== NAV) return; // navigated again while we were waiting
+    if (nav !== NAV) return;
     buildSidebar(product);
   }
 
@@ -814,10 +1531,10 @@
   function checkRoute() {
     if (location.pathname === lastPath) return;
     lastPath = location.pathname;
-    onRoute();
+    onRoute(true);
   }
-  setInterval(checkRoute, 500);
+  setInterval(checkRoute, 250);
   window.addEventListener("popstate", checkRoute);
 
-  onRoute();
+  onRoute(false);
 })();
