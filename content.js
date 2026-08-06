@@ -423,6 +423,8 @@
     const panel = document.createElement("div");
     panel.id = PANEL_ID;
     panel.className = "hd-mp-open";
+    // Panel starts open, so dock the page to match (kept in sync by togglePanel).
+    document.documentElement.classList.add("hd-mp-docked");
     panel.innerHTML = `
       <div class="hd-mp-header">
         <div class="hd-mp-title">Facebook Marketplace</div>
@@ -463,6 +465,9 @@
   function togglePanel(panel, force) {
     const open = force === undefined ? !panel.classList.contains("hd-mp-open") : force;
     panel.classList.toggle("hd-mp-open", open);
+    // Dock/undock the page so the open panel sits along the right edge rather
+    // than covering the content (see html.hd-mp-docked in sidebar.css).
+    document.documentElement.classList.toggle("hd-mp-docked", open);
   }
 
   function setStatus(panel, msg) {
@@ -684,6 +689,21 @@
         <div class="hd-mp-loc">${escapeHtml(item.location || "")}</div>
         ${item.reason ? `<div class="hd-mp-reason">${escapeHtml(item.reason)}</div>` : ""}
       </div>`;
+    // Open the listing ourselves instead of leaning on the native target=_blank.
+    // Some retailers (Target) run a document-level click interceptor that forces
+    // link clicks into the same tab (its "#lnk=sametab" rewrite), which swallows
+    // the anchor's new-tab default. Handling the click in the capture phase — and
+    // stopping it immediately — runs before that page listener can hijack it, so
+    // the listing reliably opens in a new tab everywhere.
+    a.addEventListener(
+      "click",
+      (e) => {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        window.open(item.url, "_blank", "noopener");
+      },
+      true
+    );
     if (item.image) loadThumb(a.querySelector(".hd-mp-thumb"), item.image);
     return a;
   }
@@ -761,6 +781,8 @@
       const el = document.getElementById(id);
       if (el) el.remove();
     }
+    // Undock so the page layout is restored on non-product pages / rebuilds.
+    document.documentElement.classList.remove("hd-mp-docked");
     SIGNALS = null;
     PRODUCT = null;
   }
