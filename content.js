@@ -69,7 +69,6 @@
   let SIGNALS = null; // analysis of the detected product, used for heuristic ranking
   let PRODUCT = null; // the detected product, for manual re-searches
   let SITE = null;    // the adapter for the current retailer
-  let MODE = null;    // "retail" | "marketplace"
   let LISTING = null; // the Marketplace listing, in marketplace mode
 
   const MP_ITEM_RE = /^\/marketplace\/item\/(\d+)/;
@@ -436,8 +435,6 @@
     const panel = document.createElement("div");
     panel.id = PANEL_ID;
     panel.className = "hd-mp-open";
-    // Panel starts open, so dock the page to match (kept in sync by togglePanel).
-    document.documentElement.classList.add("hd-mp-docked");
     panel.innerHTML = `
       <div class="hd-mp-header">
         <div class="hd-mp-title">Facebook Marketplace</div>
@@ -452,6 +449,8 @@
       <div class="hd-mp-body"><div class="hd-mp-status">Searching…</div></div>
     `;
     document.body.appendChild(panel);
+    // Panel starts open, so dock the page to match (kept in sync by togglePanel).
+    setDocked(true);
 
     const sub = panel.querySelector(".hd-mp-sub");
     sub.textContent = product && product.title ? `For: ${product.title}` : "Product not detected";
@@ -479,11 +478,105 @@
     const open = force === undefined ? !panel.classList.contains("hd-mp-open") : force;
     panel.classList.toggle("hd-mp-open", open);
     // Dock/undock the page so the open panel sits along the right edge rather
-    // than covering the content (see html.hd-mp-docked in sidebar.css).
-    // Facebook is laid out from full-viewport fixed elements, so shrinking the
-    // document doesn't reflow it — there the panel just overlays instead.
-    document.documentElement.classList.toggle("hd-mp-docked", open && MODE === "retail");
+    // than covering the content.
+    setDocked(open);
   }
+
+  // ---------------------------------------------------------------------------
+  // Docking
+  //
+  // Docking shrinks the document by the panel's width (html.hd-mp-docked), so
+  // the page reflows into the strip to the left of the panel instead of being
+  // covered by it. On the retailers that's the whole story: their pages are
+  // ordinary flow content.
+  //
+  // Facebook's isn't. Its chrome — the top bar, and the full-screen overlay a
+  // listing opens in — is position:fixed, so it's sized against the viewport and
+  // shrinking the document leaves it running underneath the panel.
+  //
+  // Rather than guess at Facebook's class names (they're generated, and change),
+  // ask the page what is actually under the panel: hit-test a column of points
+  // down the strip and tag every fixed box that answers, so the CSS can pull it
+  // clear. Tagging only ever adds — a box that's been pulled clear no longer
+  // answers the hit-test, and removing the tag would put it straight back under
+  // the panel, on repeat. Everything is untagged at once when we undock.
+  //
+  // Re-run on a timer, because Facebook mounts overlays long after the sidebar
+  // is up and re-renders (dropping our class) as you browse.
+  // ---------------------------------------------------------------------------
+
+  const DOCK_CLASS = "hd-mp-docked";
+  const FIXED_CLASS = "hd-mp-fixed";
+  const WIDE_CLASS = "hd-mp-fixed-wide";
+  const DOCK_SCAN_MS = 500;
+
+  let dockTimer = null;
+  let resizeTimer = null;
+
+  function setDocked(on) {
+    document.documentElement.classList.toggle(DOCK_CLASS, on);
+    clearInterval(dockTimer);
+    dockTimer = null;
+    if (!on) return untagFixed();
+    // Let the document's reflow land before measuring what's still in the strip.
+    requestAnimationFrame(dockFixedElements);
+    dockTimer = setInterval(dockFixedElements, DOCK_SCAN_MS);
+  }
+
+  function untagFixed() {
+    for (const el of document.querySelectorAll(`.${FIXED_CLASS}, .${WIDE_CLASS}`)) {
+      el.classList.remove(FIXED_CLASS, WIDE_CLASS);
+    }
+  }
+
+  function dockFixedElements() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel || !document.documentElement.classList.contains(DOCK_CLASS)) return;
+
+    const strip = panel.getBoundingClientRect();
+    if (strip.width < 1) return;
+    // On the root element these report the viewport, not the shrunken <html> —
+    // which is the box a fixed element's `100%` resolves against.
+    const vw = document.documentElement.clientWidth;
+    const vh = document.documentElement.clientHeight;
+    // Probe where the open panel comes to rest rather than where it is now: the
+    // first scan runs while it's still sliding in, and waiting out the slide
+    // would leave the page's chrome under it for the length of the animation.
+    const x = vw - strip.width / 2;
+
+    const ys = [];
+    const step = Math.max(48, Math.round(vh / 16));
+    for (let y = 1; y < vh - 1; y += step) ys.push(y);
+    ys.push(vh - 1);
+
+    const seen = new Set();
+    for (const y of ys) {
+      // elementsFromPoint reports everything under the point, panel included and
+      // ancestors as well, so one probe per row covers the whole stack there.
+      // (It skips pointer-events:none boxes — those are backdrops and glyph
+      // layers, which nobody minds seeing a sliver of behind the panel.)
+      for (const el of document.elementsFromPoint(x, y)) {
+        if (seen.has(el) || el === panel || el.id === TOGGLE_ID || panel.contains(el)) continue;
+        seen.add(el);
+        if (getComputedStyle(el).position !== "fixed") continue;
+        el.classList.add(FIXED_CLASS);
+        // Spans the viewport: narrow it. Anything shorter is only nudged — a box
+        // sized to its content would be stretched by a width of its own.
+        if (el.getBoundingClientRect().width >= vw - 4) el.classList.add(WIDE_CLASS);
+      }
+    }
+  }
+
+  // The strip is viewport-relative, so a resize changes which boxes overlap it
+  // and by how much. Start the tagging over rather than layer new tags on old.
+  window.addEventListener("resize", () => {
+    if (!document.documentElement.classList.contains(DOCK_CLASS)) return;
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+      untagFixed();
+      requestAnimationFrame(dockFixedElements);
+    }, 150);
+  });
 
   function setStatus(panel, msg) {
     panel.querySelector(".hd-mp-body").innerHTML = `<div class="hd-mp-status">${escapeHtml(msg)}</div>`;
@@ -1058,6 +1151,8 @@
       <div class="hd-mp-body"><div class="hd-mp-status">Identifying this item…</div></div>
     `;
     document.body.appendChild(panel);
+    // Panel starts open, so dock the page to match (kept in sync by togglePanel).
+    setDocked(true);
 
     panel.querySelector(".hd-mp-sub").textContent = `Listed as: ${listing.title}`;
 
@@ -1112,18 +1207,21 @@
     CORRECTION = null;
     setStatus(panel, `Searching the web and stores for “${queries.exact}”…`);
 
-    // Only the exact-item query goes to the open web. A category query ("gas
-    // grill") returns buying guides and listicles, whereas the fixed store
-    // searches genuinely do return comparable products for it.
-    const searches = [{ q: queries.exact, web: true }];
+    // Only the exact-item query goes to the open web: a category query ("gas
+    // grill") returns buying guides and listicles rather than products.
+    //
+    // Google Shopping runs for both, though — it answers a category query with
+    // actual priced products from actual merchants, which is exactly what the
+    // "Similar items" section wants and what the fixed seven can't supply. It's
+    // the only way an alternative from the maker, or from a store nobody
+    // thought to list, ever reaches that section.
+    const searches = [{ q: queries.exact, web: true, shopping: true }];
     if (queries.category && queries.category !== queries.exact) {
-      searches.push({ q: queries.category, web: false });
+      searches.push({ q: queries.category, web: false, shopping: true });
     }
 
     const t = Date.now();
-    const rounds = await Promise.all(
-      searches.map((s) => shopRound(s.q, s.web ? product.brandDomain : null, s.web))
-    );
+    const rounds = await Promise.all(searches.map((s) => shopRound(s.q, product, s)));
     if (nav !== NAV) return;
     console.log(`[MP][shop] discovery: ${Date.now() - t}ms`);
 
@@ -1150,7 +1248,7 @@
     // pass reasons over actually contains the real item.
     if (queries.fallback && queries.fallback !== queries.exact && !corroborates(product, offers)) {
       console.log(`[MP][shop] "${queries.exact}" unsupported by results — retrying "${queries.fallback}"`);
-      const extra = await shopRound(queries.fallback, product.brandDomain, true);
+      const extra = await shopRound(queries.fallback, product, { web: true, shopping: true });
       if (nav !== NAV) return;
       for (const shop of extra.shops) for (const o of shop.offers) add(o);
       for (const o of extra.web) add(o);
@@ -1246,9 +1344,25 @@
     });
   }
 
-  async function shopRound(query, brandDomain, web) {
+  // `product` carries what the web searches steer by: the maker's and specialty
+  // retailers' domains, and the model number. Only the exact-item round searches
+  // the web, but passing it always keeps the call sites uniform.
+  async function shopRound(query, product, sources) {
+    const p = product || {};
+    const s = sources || {};
     try {
-      const r = await callBg({ type: "MP_SHOP", query, web: !!web, brandDomain }, 90000);
+      const r = await callBg(
+        {
+          type: "MP_SHOP",
+          query,
+          web: !!s.web,
+          shopping: !!s.shopping,
+          domains: p.domains || [],
+          brand: p.brand || "",
+          model: p.model || "",
+        },
+        90000
+      );
       if (r && r.ok) return { shops: r.shops || [], web: r.web || [] };
     } catch (e) {
       console.warn("[MP][shop] round failed:", (e && e.message) || e);
@@ -1281,17 +1395,34 @@
     const brand = dedupe(significantTokens(product.brand));
     const cat = dedupe(significantTokens(product.category));
 
+    // Tokens that say what the thing *is*, with the brand taken out: what has to
+    // appear in a maker's own title, which never repeats the brand.
+    const brandFlat = brand.join("");
+    const rest = core.filter((k) => !brand.includes(k) && k.length > 2 && !/^\d+$/.test(k));
+
     const scored = offers.map((o) => {
       const t = String(o.title || "").toLowerCase();
       const hits = core.filter((k) => k.length > 1 && t.includes(k)).length;
       const overlap = core.length ? hits / core.length : 0;
-      const brandMatch = brand.length > 0 && brand.every((b) => t.includes(b));
       const catMatch = cat.length > 0 && cat.every((c) => t.includes(c));
+
+      // A brand's own storefront doesn't put its name in its product titles —
+      // Solo Stove sells a "Bonfire 2.0", not a "Solo Stove Bonfire 2.0" — so
+      // matching on the title alone buries the one store guaranteed to have the
+      // real thing. The domain carries the brand instead, so read it from there.
+      // Still require the title to say what the product is, or every accessory
+      // page on the maker's site would qualify.
+      const makersOwn =
+        brandFlat.length > 3 &&
+        String(o.shop || "").replace(/[^a-z0-9]/g, "").includes(brandFlat) &&
+        rest.some((k) => t.includes(k));
+      const brandMatch = makersOwn || (brand.length > 0 && brand.every((b) => t.includes(b)));
+
       let bucket;
-      if (overlap >= 0.6 || (brandMatch && overlap >= 0.4)) bucket = "exact";
+      if (overlap >= 0.6 || makersOwn || (brandMatch && overlap >= 0.4)) bucket = "exact";
       else if (brandMatch || catMatch) bucket = "similar";
       else bucket = "related";
-      return { ...o, bucket, score: overlap };
+      return { ...o, bucket, score: makersOwn ? Math.max(overlap, 0.6) : overlap };
     });
 
     const rank = { exact: 0, similar: 1, related: 2 };
@@ -1484,13 +1615,12 @@
       if (el) el.remove();
     }
     // Undock so the page layout is restored on non-product pages / rebuilds.
-    document.documentElement.classList.remove("hd-mp-docked");
+    setDocked(false);
     SIGNALS = null;
     PRODUCT = null;
     LISTING = null;
     IDENTIFIED = null;
     CORRECTION = null;
-    MODE = null;
   }
 
   async function onRoute(spaNav) {
@@ -1503,7 +1633,6 @@
     if (location.hostname === "www.facebook.com") {
       // Marketplace search/category/inbox pages — stay out.
       if (!MP_ITEM_RE.test(location.pathname)) return;
-      MODE = "marketplace";
       const listing = await waitForListing(prevTitle, spaNav);
       if (nav !== NAV) return; // navigated again while we were waiting
       if (!listing) return;
@@ -1514,7 +1643,6 @@
     // Not a product page (search, category, cart, unknown host) — stay out.
     if (!SITE || !SITE.productRe.test(location.pathname)) return;
 
-    MODE = "retail";
     const product = await waitForProduct(prevTitle);
     if (nav !== NAV) return;
     buildSidebar(product);

@@ -69,7 +69,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   }
 
   if (msg.type === "MP_SHOP") {
-    shopSearch(msg.query, { web: !!msg.web, brandDomain: msg.brandDomain })
+    shopSearch(msg.query, {
+      web: !!msg.web,
+      shopping: !!msg.shopping,
+      domains: msg.domains || [],
+      brand: msg.brand || "",
+      model: msg.model || "",
+    })
       .then((r) => sendResponse({ ok: true, shops: r.shops, web: r.web }))
       .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
     return true;
@@ -410,11 +416,14 @@ async function llmIdentify(listing) {
     '- "fallback": the same query with NO model or series name — brand + product type only (e.g. "IKEA wing chair"). ' +
     "This is used to recover if the model turns out to be wrong, so it must never contain a model name.\n" +
     '- "category": 2-4 words naming just the product type, used to find comparable alternatives.\n\n' +
-    'Also set "brandDomain" to the manufacturer\'s own storefront domain (e.g. "castlery.com", "westelm.com") when you are ' +
-    "confident of it — many items are sold mainly by the brand itself. Leave it empty if you would be guessing.\n\n" +
+    'Also set "domains" to up to 3 US storefront domains most likely to sell this exact item: the manufacturer\'s own ' +
+    "store first when you know it — many items are sold mainly by the brand itself — then the specialty retailers that " +
+    "actually carry this category. Skip the big-box generalists (Amazon, eBay, Walmart, Target, Home Depot, Lowe's and " +
+    "Best Buy are already searched separately, so naming one wastes a slot). Return fewer domains, or none at all, " +
+    "rather than guessing at ones you don't believe exist.\n\n" +
     "Respond with ONLY a JSON object, no prose and no code fences:\n" +
     '{"name":"full retail product name","brand":"","model":"","category":"short product type",' +
-    '"brandDomain":"","confidence":"high|medium|low",' +
+    '"domains":[],"confidence":"high|medium|low",' +
     '"queries":{"exact":"...","fallback":"...","category":"..."}}';
 
   const imageDataUrl = await listingPhotoData(listing.image);
@@ -437,7 +446,7 @@ async function llmIdentify(listing) {
     brand: String(out.brand || "").trim(),
     model: String(out.model || "").trim(),
     category: String(out.category || "").trim(),
-    brandDomain: cleanDomain(out.brandDomain),
+    domains: cleanDomains(out.domains),
     confidence: String(out.confidence || "low").trim(),
     usedPhoto: !!imageDataUrl,
   };
@@ -542,7 +551,7 @@ async function llmVerify(listing, product, offers) {
   return { ok: true, usedLLM: true, product: corrected, changed, note, matchRef: out.matchRef ?? null };
 }
 
-// The model is asked for a bare domain but will sometimes return a full URL or
+// The model is asked for bare domains but will sometimes return a full URL or
 // a sentence. Accept only something that actually looks like a hostname, since
 // it goes straight into a `site:` search operator.
 function cleanDomain(v) {
@@ -553,6 +562,17 @@ function cleanDomain(v) {
     .replace(/^www\./, "")
     .replace(/[/?#].*$/, "");
   return /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/.test(s) ? s : "";
+}
+
+// Drop repeats, and drop the stores in SHOPS: those are searched directly, so a
+// `site:` search for one spends a slot on a row we already have.
+function cleanDomains(v) {
+  const out = [];
+  for (const d of Array.isArray(v) ? v : [v]) {
+    const clean = cleanDomain(d);
+    if (clean && !out.includes(clean) && !COVERED_DOMAINS.includes(clean)) out.push(clean);
+  }
+  return out.slice(0, 3);
 }
 
 const SHOP_STOP = new Set([
@@ -570,22 +590,35 @@ function shopTokens(s) {
     .filter((t) => t && !SHOP_STOP.has(t));
 }
 
+// No API key: everything has to come out of the seller's own title.
+//
+// The brand is worth guessing — Marketplace titles lead with it almost without
+// exception, and it's what lets a result be recognised as the same product. The
+// category is not: the last token of "…with Carrying Case 19.5" is "5", and a
+// category of "5" matches any title with a size in it, which is all of them. An
+// empty category is scored as "unknown" downstream; a wrong one is scored as a
+// match, so guessing costs more than admitting we don't know.
 function heuristicIdentify(listing) {
   const toks = shopTokens(listing.title);
   return {
     product: {
       name: listing.title || "",
-      brand: "",
+      brand: toks.slice(0, 2).join(" "),
       model: "",
-      category: toks.slice(-1)[0] || "",
-      brandDomain: "",
+      category: "",
+      domains: [],
       confidence: "low",
       usedPhoto: false,
     },
     queries: {
       exact: toks.slice(0, 5).join(" "),
       fallback: toks.slice(0, 3).join(" "),
-      category: toks.slice(-2).join(" "),
+      // No category. The last two tokens of a seller's title are as likely to
+      // be "19 5" as they are to be "fire pit", and the category query is what
+      // fills the "Similar items" section — so guessing it wrong doesn't give
+      // you worse alternatives, it gives you a section full of whatever the
+      // stores return for "19 5". Empty means that round is skipped.
+      category: "",
     },
   };
 }
@@ -612,11 +645,16 @@ async function llmMatchOffers(product, offers) {
   const system =
     "You compare a shopper's target product against products found in online store search results, and classify each one.\n" +
     "Buckets:\n" +
-    "- exact: the same product. Same brand and model line. A different color or size of the same model still counts as exact.\n" +
+    "- exact: the same product. Same brand and model line. A different color or size of the same model still counts as exact, " +
+    "and so does a bundle built AROUND the product — the item plus its stand, case, cover or starter kit. That is how " +
+    "manufacturers package their own product, so treating it as an accessory drops the maker's own listing, which is the " +
+    "one the shopper most wants to see.\n" +
     "- similar: a different product the shopper would genuinely cross-shop — same product type and a comparable class/price tier.\n" +
     "- related: same broad category but a weaker match.\n" +
-    "- exclude: not the product itself. Accessories, parts, covers, replacement components, filters, manuals, bundles of accessories, " +
-    "or plainly unrelated items. Be strict: a cover or a replacement part for the target product is 'exclude', never 'similar'.\n" +
+    "- exclude: not the product itself. Accessories, parts, covers, replacement components, filters or manuals sold ON THEIR " +
+    "OWN; a bundle of accessories that does not include the product; or plainly unrelated items. Be strict: a cover or a " +
+    "replacement part for the target product is 'exclude', never 'similar' — but a bundle containing the product is not an " +
+    "accessory, it is the product.\n" +
     "Give a short (<=8 word) reason for each.";
 
   const user =
@@ -726,18 +764,13 @@ async function shopSearch(query, opts = {}) {
   query = String(query || "").trim();
   if (!query) throw new Error("empty query");
 
-  // The fixed store list covers the big boxes well and is cheap, but it can
-  // never include a direct-to-consumer brand. Web discovery runs alongside it
-  // for the exact-item query and reaches anywhere, the manufacturer included.
-  const webPromise = opts.web
-    ? discoverOnWeb(query, opts.brandDomain).catch((e) => {
-        console.warn("[MP][web] discovery failed:", (e && e.message) || e);
-        return [];
-      })
-    : Promise.resolve([]);
-
   const started = Date.now();
-  const shops = await Promise.all(
+
+  // The fixed store list covers the big boxes well and is cheap, but it can
+  // never include a direct-to-consumer brand. Web discovery reaches anywhere,
+  // the manufacturer included. The store fetches are ordinary requests, so they
+  // run alongside everything below.
+  const shopsPromise = Promise.all(
     SHOPS.map(async (shop) => {
       const searchUrl = shop.search(query);
       const base = { key: shop.key, name: shop.name, searchUrl };
@@ -759,13 +792,41 @@ async function shopSearch(query, opts = {}) {
     })
   );
 
-  const web = await webPromise;
+  // Shopping first, deliberately. Both it and the web searches queue behind the
+  // same single tab, so ordering them costs nothing — and going first means its
+  // results, which are observed rather than recalled, get to inform which
+  // site: searches are still worth running. Evidence before memory, the same
+  // reason corroborates() exists.
+  const shopping = opts.shopping
+    ? await shoppingSearch(query).catch((e) => {
+        console.warn("[MP][shopping] failed:", (e && e.message) || e);
+        return [];
+      })
+    : [];
+  const pricedKeys = new Set(shopping.filter((o) => o.price).map((o) => o.shop));
+
+  const { offers: discovered, blocked } = opts.web
+    ? await discoverOnWeb(query, { ...opts, pricedKeys }).catch((e) => {
+        console.warn("[MP][web] discovery failed:", (e && e.message) || e);
+        return { offers: [], blocked: [] };
+      })
+    : { offers: [], blocked: [] };
+
+  const shops = await shopsPromise;
+  // Shopping results are already priced and already attributed to a merchant,
+  // so they join the pool directly. They also arrive for stores whose own pages
+  // can't be read at all, which is most manufacturers.
+  const web = discovered.concat(shopping.filter((o) => !discovered.some((d) => d.shop === o.shop && d.id === o.id)));
+  // Stores found on the web but unreadable ride along as shops with no offers,
+  // which is exactly what heroCard() already renders as a "search here" link.
+  const withBlocked = shops.concat(blocked.filter((b) => !shops.some((s) => s.key === b.key)));
   const total = shops.reduce((n, s) => n + s.offers.length, 0);
   console.log(
     `[MP][shop] "${query}" → ${total} offers from ${shops.length} stores + ` +
-      `${web.length} from the open web in ${Date.now() - started}ms`
+      `${discovered.length} from the open web + ${shopping.length} from Google Shopping ` +
+      `in ${Date.now() - started}ms`
   );
-  return { shops, web };
+  return { shops: withBlocked, web };
 }
 
 // ---------------------------------------------------------------------------
@@ -809,40 +870,107 @@ const FOREIGN_TLD =
   /\.(?:tr|de|fr|it|es|nl|se|no|dk|fi|pl|cz|sk|hu|ro|gr|pt|ie|be|at|ch|ru|ua|cn|jp|kr|tw|hk|sg|my|th|ph|vn|id|in|pk|il|sa|ae|au|nz|br|mx|ar|cl|uk|za|ca)$/i;
 
 const WEB_LINKS_PER_QUERY = 8;
-const WEB_MAX_PAGES = 10;
+const WEB_MAX_QUERIES = 4;
+const WEB_MAX_PAGES = 14;
+const WEB_MAX_BLOCKED = 4; // unreadable stores offered as plain links
 const PAGE_MAX_BYTES = 700_000;
 const PAGE_TIMEOUT_MS = 10000;
 
+// The stores in SHOPS are searched directly, every time. A web result from one
+// of them therefore can't add a row — productFromPage() deliberately keys it
+// into that store's existing row — so fetching one spends discovery budget,
+// which is the only thing that can surface a retailer we don't already have.
+// Both engines honour `-site:`, and the host filter in discoverOnWeb() covers
+// the case where one ignores it.
+const COVERED_DOMAINS = SHOPS.map((s) => new URL(s.search("x")).hostname.replace(/^www\./, ""));
+const COVERED_KEYS = new Set(SHOPS.map((s) => s.key));
+const EXCLUDE_COVERED = COVERED_DOMAINS.map((d) => "-site:" + d).join(" ");
+
+function isCoveredStore(url) {
+  try {
+    return COVERED_KEYS.has(storeKey(new URL(url).hostname));
+  } catch {
+    return false;
+  }
+}
+
 // Hosts that are never the retailer we're looking for.
+// Includes the engines' own boilerplate: Bing's result pages carry links to
+// go.microsoft.com and support.microsoft.com, which sailed through as "stores"
+// and turned up in the sidebar as a chip labelled "Go".
 const NOT_A_STORE =
-  /(^|\.)(?:duckduckgo|bing|google|googleusercontent|yahoo|facebook|fb|instagram|pinterest|reddit|youtube|twitter|x|tiktok|quora|wikipedia|tripadvisor|yelp|linkedin|medium|blogspot|wordpress|craigslist|offerup|nextdoor)\.[a-z.]+$/i;
+  /(^|\.)(?:duckduckgo|bing|google|googleusercontent|gstatic|yahoo|microsoft|msn|live|facebook|fb|instagram|pinterest|reddit|youtube|twitter|x|tiktok|quora|wikipedia|tripadvisor|yelp|linkedin|medium|blogspot|wordpress|craigslist|offerup|nextdoor)\.[a-z.]+$/i;
 
 const NOT_A_PRODUCT_PATH = /\/(?:blog|news|articles?|reviews?|guides?|help|support|careers|about)(?:\/|$)/i;
 
-async function discoverOnWeb(query, brandDomain) {
-  const queries = [query];
-  // The maker's own site is the one page guaranteed to describe the item
-  // exactly, and it's often outranked by resellers.
-  if (brandDomain) queries.push(`${query} site:${brandDomain}`);
+// The searches that reach past the seven fixed stores.
+//
+// The plain query is the weakest of them for this purpose: run as-is, a product
+// search is dominated by the big boxes, which are already covered — so it's
+// asked to skip them, which is what lets the long tail rank at all. Then the
+// maker's own storefront and whatever specialty retailers identification named,
+// each as a `site:` search, because a brand is routinely outranked by its own
+// resellers. And the model number in quotes, which is the highest-precision
+// handle there is on a small retailer's catalogue.
+//
+// Capped, because these run in parallel and a fistful of simultaneous requests
+// is how you get rate-limited by an engine that was answering fine.
+// Each entry carries the query to run and the same query without the exclusion
+// operators, which webSearch() falls back to if the engine returns nothing.
+//
+// Note what isn't here: a search on the model number. It's tempting — a model
+// code is the sharpest handle there is on a small retailer's catalogue — but
+// it's also the field identification is most likely to invent, which is why
+// corroborates() exists to test it against retrieved titles before anything is
+// graded. Searching it here would run before that test, and an exact-phrase
+// search for a model that doesn't exist doesn't come back empty, it comes back
+// with the wrong product line's pages — which then become the evidence the
+// verification pass reasons over. The model still reaches the search through
+// `query` itself, where identification put it, and where a wrong one degrades
+// to a keyword rather than a demand.
+function webQueries(query, opts) {
+  const priced = opts.pricedKeys || new Set();
+  const domains = (opts.domains || []).filter(Boolean).filter((d) => {
+    // Identification named this store from memory; Google Shopping has since
+    // shown it actually sells the thing, and at what price. There's nothing
+    // left for a site: search to find, so spend the slot on a store we don't
+    // have yet.
+    if (!priced.has(storeKey(d))) return true;
+    console.log(`[MP][web] skipping site:${d} — already priced from Google Shopping`);
+    return false;
+  });
 
-  const lists = await Promise.all(queries.map((q) => webSearch(q)));
+  const qs = [];
+  const add = (bare, exclude) => qs.push({ q: exclude ? `${bare} ${EXCLUDE_COVERED}` : bare, bare });
 
-  const links = [];
-  const seen = new Set();
-  for (const list of lists) {
-    for (const l of list) {
-      const key = canonicalKey(l.url);
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      links.push(l);
-    }
-  }
+  add(query, true);
+  for (const d of domains) add(`${query} site:${d}`, false);
 
+  return qs.slice(0, WEB_MAX_QUERIES);
+}
+
+async function discoverOnWeb(query, opts = {}) {
+  const queries = webQueries(query, opts);
+  console.log(`[MP][web] ${queries.length} queries:`, queries.map((s) => s.q));
+
+  const lists = (await Promise.all(queries.map((s) => webSearch(s.q, s.bare)))).map((list) =>
+    list.filter((l) => !isCoveredStore(l.url)).slice(0, WEB_LINKS_PER_QUERY)
+  );
+
+  // Round-robin, not concatenate. Taking the first N of a flat list spends the
+  // whole budget on whichever query happens to be first — which is how the
+  // maker's own site used to end up with the two slots nobody else wanted.
+  const links = interleave(lists);
   const picked = links.slice(0, WEB_MAX_PAGES);
   if (links.length > picked.length) {
     console.log(`[MP][web] fetching ${picked.length} of ${links.length} candidate pages`);
   }
 
+  // The stores identification named: we asked for these by name, so a page from
+  // one of them that can't be read is worth reporting rather than discarding.
+  const targeted = new Set((opts.domains || []).filter(Boolean).map(storeKey));
+
+  const blocked = new Map();
   const pages = await Promise.all(
     picked.map(async (l) => {
       try {
@@ -851,21 +979,549 @@ async function discoverOnWeb(query, brandDomain) {
           timeoutMs: PAGE_TIMEOUT_MS,
           credentials: "omit",
         });
-        if (status >= 400) return null;
-        return productFromPage(html, finalUrl || l.url, l.title);
+        if (status >= 400) return noteBlocked(blocked, l, "HTTP " + status);
+        if (BOT_WALL.test(html.slice(0, 20000))) {
+          return noteBlocked(blocked, l, "blocked by bot check");
+        }
+        const offer = productFromPage(html, finalUrl || l.url, l.title);
+        if (!offer) {
+          // A page with no product data is usually a listicle, and chipping
+          // those would be noise. But on a store we went looking for by name,
+          // it means the opposite: the right page, published in a way we can't
+          // read (client-rendered prices, mostly). Dropping that silently is
+          // how the manufacturer disappears with nothing to show for it.
+          if (targeted.has(storeKeyOf(l.url))) {
+            return noteBlocked(blocked, l, "page has no machine-readable price");
+          }
+          console.log("[MP][web] no product data on", l.url);
+        }
+        return offer;
       } catch (e) {
-        console.warn("[MP][web] page failed:", l.url, (e && e.message) || e);
-        return null;
+        return noteBlocked(blocked, l, String((e && e.message) || e));
       }
     })
   );
 
   const offers = pages.filter(Boolean);
-  console.log(`[MP][web] ${offers.length} product pages from ${picked.length} fetched`);
+  console.log(
+    `[MP][web] ${offers.length} product pages from ${picked.length} fetched` +
+      (blocked.size ? `, ${blocked.size} unreadable (offered as links)` : "")
+  );
+  return { offers, blocked: [...blocked.values()].slice(0, WEB_MAX_BLOCKED) };
+}
+
+// A page we found but couldn't read is still a lead worth showing.
+//
+// Most manufacturers sit behind a bot check that a scripted fetch can't pass —
+// solostove.com answers one with a Cloudflare "Managed Challenge" — and until
+// now that page was dropped on the floor with no log and nothing in the UI, so
+// the maker's own store simply never appeared and there was no way to tell why.
+// A fixed store in the same position already degrades to a "search here" link;
+// this gives a discovered store the same treatment, shaped like a SHOPS entry so
+// heroCard() renders it through the path that already exists.
+function noteBlocked(map, link, reason) {
+  let host;
+  try {
+    host = new URL(link.url).hostname;
+  } catch {
+    return null;
+  }
+  const key = storeKey(host);
+  if (COVERED_KEYS.has(key)) return null;
+
+  // One link per store, and prefer the deepest path of the ones we saw: a
+  // search turns up the storefront's front page as readily as the product, and
+  // sending someone to solostove.com's homepage isn't much of an answer.
+  const existing = map.get(key);
+  if (existing && pathDepth(existing.searchUrl) >= pathDepth(link.url)) return null;
+
+  console.warn(`[MP][web] ${key}: ${reason} — offering the link instead of dropping it`, link.url);
+  map.set(key, { key, name: storeLabel(host), searchUrl: link.url, error: reason, offers: [] });
+  return null;
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return "";
+  }
+}
+
+// "Solo Stove" -> "solostove", the same key storeKey() derives from
+// solostove.com, so a merchant named in a shopping tile and that merchant's own
+// domain collapse into one row instead of appearing twice.
+function nameKey(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "")
+    .slice(0, 40);
+}
+
+function storeKeyOf(url) {
+  try {
+    return storeKey(new URL(url).hostname);
+  } catch {
+    return "";
+  }
+}
+
+function pathDepth(url) {
+  try {
+    return new URL(url).pathname.split("/").filter(Boolean).length;
+  } catch {
+    return 0;
+  }
+}
+
+// One from each list in turn, dropping URLs already taken. A page that ranks
+// for two of the queries is taken once, by whichever asked first — the other
+// list then contributes one more of its own rather than losing the slot.
+function interleave(lists) {
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; lists.some((l) => i < l.length); i++) {
+    for (const list of lists) {
+      const l = list[i];
+      if (!l) continue;
+      const key = canonicalKey(l.url);
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(l);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Searching in a real tab
+//
+// The engines' scriptable endpoints have stopped being usable: DuckDuckGo's
+// HTML and lite endpoints answer with a challenge page (HTTP 202, no results),
+// and Bing returns HTTP 200 with the right <title> and an empty results shell —
+// which is the worse failure, because nothing downstream can tell it apart from
+// "no matches". Between them the open-web path can contribute nothing, and the
+// sidebar falls back to the seven fixed stores every time.
+//
+// A tab isn't scriptable traffic — it's the browser, with the user's session
+// and a real fingerprint — so the search works there. Open one in the
+// background, read the results out with chrome.scripting, and close it.
+//
+// One tab, reused, one query at a time: four tabs appearing and vanishing in
+// someone's tab strip is not a reasonable thing to do to them.
+// ---------------------------------------------------------------------------
+
+const TAB_SEARCH_PREF = "mp_tabSearch";
+const TAB_LOAD_TIMEOUT_MS = 9000;
+const TAB_POLL_MS = 300;
+// Short: the tab closes as soon as the last queued read finishes, and this only
+// covers the gap between one search being handed back and the next being
+// queued, so the tab isn't torn down and rebuilt mid-batch. It's deliberately
+// not a "close it later" timer — the service worker can be shut down at any
+// point once the work is done, and a timer that never fires leaves a Google tab
+// sitting in someone's window permanently.
+const TAB_IDLE_CLOSE_MS = 750;
+const TAB_MAX_MISSES = 2; // give up on the tab after this many empty searches in a row
+const tabSearchUrl = (q) =>
+  "https://www.google.com/search?q=" + encodeURIComponent(q) + "&num=20&hl=en&gl=us";
+
+let searchTabId = null;
+let searchTabQueue = Promise.resolve();
+let searchTabCloser = null;
+let tabSearchMisses = 0;
+// When the tab route is a dead end — no window to open one in, or searches that
+// keep coming back empty — stand down for a while. The queries are serialized,
+// so without this a Google that won't answer costs the timeout once per query
+// before anything falls through to the HTML endpoints.
+//
+// A cooldown rather than a latch: a service worker can stay alive across a long
+// browsing session, and one bad patch used to disable the tab — and with it
+// Google Shopping, which is the only source that prices a manufacturer — for
+// the rest of that session, silently.
+const TAB_COOLDOWN_MS = 120000;
+let tabSearchOffUntil = 0;
+let tabSearchOffReason = "";
+
+function standDownTabSearch(reason) {
+  tabSearchOffUntil = Date.now() + TAB_COOLDOWN_MS;
+  tabSearchOffReason = reason;
+  tabSearchMisses = 0;
+  console.warn(`[MP][tab] standing down for ${TAB_COOLDOWN_MS / 1000}s: ${reason}`);
+  closeSearchTab();
+}
+
+// Every "no" is logged. Silence here reads downstream as "Google Shopping had
+// nothing", which is a completely different diagnosis from "we never asked".
+function tabSearchEnabled() {
+  return new Promise((resolve) => {
+    if (!chrome.tabs || !chrome.scripting) {
+      console.warn("[MP][tab] unavailable: the tabs/scripting APIs aren't there (is the extension reloaded?)");
+      return resolve(false);
+    }
+    const left = tabSearchOffUntil - Date.now();
+    if (left > 0) {
+      console.log(`[MP][tab] skipped — ${tabSearchOffReason}; retrying in ${Math.ceil(left / 1000)}s`);
+      return resolve(false);
+    }
+    chrome.storage.local.get([TAB_SEARCH_PREF], (cfg) => {
+      const on = cfg[TAB_SEARCH_PREF] !== false;
+      if (!on) console.log('[MP][tab] skipped — "Search the web in a background tab" is off in the options');
+      resolve(on);
+    });
+  });
+}
+
+// Serialize: the queries run in parallel, the tab can't.
+//
+// `tabPending` is what decides when the tab goes away — it's closed once the
+// last queued read has been handed back, rather than on a timer, so it doesn't
+// outlive the work that needed it.
+let tabPending = 0;
+
+function queueTabScrape(url, func, label) {
+  tabPending++;
+  const run = searchTabQueue.then(() =>
+    tabScrape(url, func, label).catch((e) => {
+      console.warn(`[MP][tab] ${label} failed:`, (e && e.message) || e);
+      return [];
+    })
+  );
+  searchTabQueue = run.then(
+    () => finishTabScrape(),
+    () => finishTabScrape()
+  );
+  return run;
+}
+
+function finishTabScrape() {
+  if (--tabPending > 0) return;
+  clearTimeout(searchTabCloser);
+  searchTabCloser = setTimeout(() => {
+    if (tabPending === 0) closeSearchTab();
+  }, TAB_IDLE_CLOSE_MS);
+}
+
+// Navigate the tab, then poll it until the injected reader finds something.
+// Polling rather than waiting on a load event because the results are rendered
+// after load, and because the injection itself fails until the tab has
+// committed a document to inject into.
+async function tabScrape(url, func, label) {
+  // Re-check on the way in, not just before queueing. The queries are dispatched
+  // together and all pass the check at once, so a stand-down triggered by the
+  // first of them used to do nothing for the rest — every one still paid the
+  // full timeout. That's how one listing spent 65s in here.
+  if (tabSearchOffUntil > Date.now()) {
+    console.log(`[MP][tab] ${label}: skipped, ${tabSearchOffReason}`);
+    return [];
+  }
+  clearTimeout(searchTabCloser);
+  const tabId = await openSearchTab(url);
+  const started = Date.now();
+  let items = [];
+  let attempts = 0;
+  let lastError = null;
+  while (Date.now() - started < TAB_LOAD_TIMEOUT_MS) {
+    await sleep(TAB_POLL_MS);
+    attempts++;
+    try {
+      const frames = await chrome.scripting.executeScript({ target: { tabId }, func });
+      const got = (frames && frames[0] && frames[0].result) || [];
+      if (got.length) {
+        items = got;
+        break;
+      }
+    } catch (e) {
+      // Expected while the tab is still navigating; only interesting if it's
+      // still happening when we give up.
+      lastError = (e && e.message) || String(e);
+    }
+  }
+
+  console.log(`[MP][tab] ${label} → ${items.length} items in ${Date.now() - started}ms (${attempts} reads)`);
+  if (!items.length) {
+    console.warn(
+      `[MP][tab] ${label}: nothing read after ${attempts} attempts` +
+        (lastError ? ` (last injection error: ${lastError})` : ""),
+      url
+    );
+    // "The reader matched nothing" has two completely different causes — the
+    // engine served a challenge instead of results, or the page is fine and the
+    // selectors are wrong — and they need opposite fixes. Ask the page which it
+    // is rather than guessing from the outside.
+    if (!lastError) await probeTab(tabId, label);
+  }
+  return items;
+}
+
+// Organic results, filtered down to links worth fetching.
+async function tabSearch(query) {
+  const raw = await queueTabScrape(tabSearchUrl(query), scrapeResultsInPage, `search "${query}"`);
+
+  const links = [];
+  const seen = new Set();
+  for (const l of raw) {
+    const url = resolveResultUrl(l.url);
+    if (!url) continue;
+    const key = canonicalKey(url);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    links.push({ url, title: l.title });
+  }
+  if (raw.length && !links.length) {
+    console.warn(`[MP][tab] all ${raw.length} results were filtered out`, raw.slice(0, 5).map((l) => l.url));
+  }
+
+  if (links.length) {
+    tabSearchMisses = 0;
+  } else if (++tabSearchMisses >= TAB_MAX_MISSES) {
+    standDownTabSearch(`${TAB_MAX_MISSES} empty searches in a row`);
+  }
+  return links;
+}
+
+async function openSearchTab(url) {
+  if (searchTabId != null) {
+    try {
+      await chrome.tabs.get(searchTabId); // throws once the user closes it
+      await chrome.tabs.update(searchTabId, { url });
+      return searchTabId;
+    } catch {
+      searchTabId = null;
+    }
+  }
+  try {
+    const tab = await chrome.tabs.create({ url, active: false });
+    searchTabId = tab.id;
+    return searchTabId;
+  } catch (e) {
+    // No window to put a tab in, or the API is unavailable in this context.
+    standDownTabSearch("could not open a search tab: " + ((e && e.message) || e));
+    throw new Error("could not open a search tab");
+  }
+}
+
+async function closeSearchTab() {
+  const id = searchTabId;
+  searchTabId = null;
+  if (id == null) return;
+  try {
+    await chrome.tabs.remove(id);
+  } catch {
+    /* already gone */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Google Shopping
+//
+// The shopping tab answers the question the sidebar is actually asking: it
+// lists, per merchant, what this product costs — the manufacturer and the
+// specialty chains included, already priced, already titled. Reading it avoids
+// the step that fails most often: fetching a retailer's own page, which for a
+// direct-to-consumer brand usually means a bot check the worker can't pass.
+//
+// It's the same reusable tab, so this costs one more navigation, not a window
+// full of tabs.
+// ---------------------------------------------------------------------------
+
+const shoppingSearchUrl = (q) =>
+  "https://www.google.com/search?udm=28&hl=en&gl=us&q=" + encodeURIComponent(q);
+
+// Runs inside the tab; self-contained, like scrapeResultsInPage.
+//
+// Deliberately structural rather than class-based: Google's shopping markup is
+// generated and its class names change constantly, but the shape doesn't — a
+// tile is a link to a merchant with a price somewhere above it. So walk up from
+// each outbound link to the nearest ancestor carrying a price and read that.
+function scrapeShoppingInPage() {
+  const PRICE = /\$\s?\d[\d,]*(?:\.\d{2})?/;
+  // Lines that appear in a tile but never name a merchant.
+  const CHROME =
+    /^(?:sponsored|free delivery|free shipping|in stock|out of stock|delivery|pickup|returns|sale|by |compare|visit site|\d[\d.]*\s*\(|\(\d|\d+\+? (?:reviews?|ratings?)|save |was |used|refurbished|new)/i;
+  const out = [];
+  const seen = new Set();
+
+  for (const a of document.querySelectorAll("a[href]")) {
+    let href = a.href || "";
+    // Shopping tiles route through Google's redirector when they leave at all.
+    const wrapped = href.match(/[?&](?:url|adurl|q)=([^&]+)/);
+    if (wrapped) {
+      try {
+        href = decodeURIComponent(wrapped[1]);
+      } catch (e) {
+        /* keep the original */
+      }
+    }
+    if (!/^https?:\/\//i.test(href)) continue;
+    let host;
+    try {
+      host = new URL(href).hostname;
+    } catch (e) {
+      continue;
+    }
+    if (/(^|\.)googleadservices\./i.test(host)) continue;
+    // Most shopping tiles link to Google's own product page rather than to the
+    // merchant — skipping those, as this used to, threw away nearly every tile
+    // on the page. Keep them: the merchant is named in the tile's own text, and
+    // the Google product page is still a usable link.
+    const onGoogle = /(^|\.)google\.[a-z.]+$/i.test(host);
+    if (onGoogle && !/\/shopping\//.test(href)) continue;
+
+    let tile = a;
+    let text = "";
+    for (let i = 0; i < 8 && tile; i++) {
+      text = (tile.innerText || "").trim();
+      if (PRICE.test(text)) break;
+      tile = tile.parentElement;
+    }
+    if (!tile || !PRICE.test(text) || text.length > 700) continue;
+
+    const lines = text.split("\n").map((s) => s.trim()).filter(Boolean);
+    const title =
+      (a.innerText || "").trim().split("\n")[0] ||
+      lines.find((l) => l.length > 12 && !PRICE.test(l)) ||
+      "";
+    if (!title || title.length < 6) continue;
+
+    // The merchant: a short line that isn't the title, isn't a price and isn't
+    // one of the badges Google stacks under it. Only needed when the tile links
+    // to Google rather than to the store, but it's the nicer label either way.
+    const merchant =
+      lines.find(
+        (l) => l !== title && l.length >= 2 && l.length <= 40 && !PRICE.test(l) && !CHROME.test(l) && /[a-z]{2}/i.test(l)
+      ) || "";
+    if (onGoogle && !merchant) continue; // nothing to attribute it to
+
+    const key = (merchant || host) + "|" + title.slice(0, 60).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const img = tile.querySelector("img");
+    out.push({
+      url: href,
+      merchant,
+      title: title.slice(0, 300),
+      price: text.match(PRICE)[0].replace(/\s+/g, ""),
+      image: img && /^https?:/i.test(img.src || "") ? img.src : null,
+    });
+    if (out.length >= 40) break;
+  }
+  return out;
+}
+
+async function shoppingSearch(query) {
+  if (!(await tabSearchEnabled())) return [];
+  const raw = await queueTabScrape(shoppingSearchUrl(query), scrapeShoppingInPage, "shopping");
+  const offers = [];
+  const seen = new Set();
+  for (const r of raw) {
+    // A tile that links straight to the store is best. When it only links to
+    // Google's product page, fall back to the merchant Google named — keyed the
+    // same way a domain would be, so "Solo Stove" and solostove.com collapse
+    // into one row rather than showing up twice.
+    const direct = resolveResultUrl(r.url);
+    // The merchant-name fallback is only for tiles that never leave Google. If
+    // the tile *does* link out and resolveResultUrl turned it down, that was on
+    // purpose — a foreign storefront, or not a store at all — and naming the
+    // merchant mustn't smuggle it back in with a price in the wrong currency.
+    if (!direct && !/(^|\.)google\.[a-z.]+$/i.test(hostOf(r.url))) {
+      console.log("[MP][shopping] tile rejected by the link filters:", r.url);
+      continue;
+    }
+    const host = direct ? hostOf(direct) : "";
+    const shop = host ? storeKey(host) : nameKey(r.merchant);
+    if (!shop) {
+      console.log("[MP][shopping] tile with no merchant and no usable link, skipping:", r.title);
+      continue;
+    }
+    const url = direct || r.url;
+    const id = canonicalKey(url) || url;
+    const key = shop + ":" + id;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    offers.push({
+      id,
+      shop,
+      shopName: host ? storeLabel(host) : r.merchant,
+      url,
+      title: r.title,
+      price: r.price,
+      image: r.image,
+      source: "shopping",
+    });
+  }
+  console.log(`[MP][shopping] "${query}" → ${offers.length} priced merchants from ${raw.length} tiles`);
   return offers;
 }
 
-async function webSearch(query) {
+// Runs inside the tab. Must be self-contained — it's serialized and injected,
+// so it can't close over anything here. Google marks every organic result with
+// an <h3> inside its link, which has survived a lot of layout churn.
+function scrapeResultsInPage() {
+  const out = [];
+  // `a[href]` and the .href *property*, not `a[href^="http"]`: Google serves
+  // plenty of results as relative "/url?q=…" redirects, whose href attribute
+  // starts with a slash. Matching on the attribute skipped every one of them
+  // before the redirect unwrapping downstream ever got a look at it.
+  for (const a of document.querySelectorAll("a[href]")) {
+    const h3 = a.querySelector("h3");
+    if (!h3) continue;
+    const title = (h3.textContent || "").trim();
+    if (!title || !/^https?:/i.test(a.href)) continue;
+    out.push({ url: a.href, title });
+    if (out.length >= 30) break;
+  }
+  return out;
+}
+
+// Runs inside the tab; self-contained. Reports what's actually on the page so a
+// zero-result read can be told apart from a block.
+function describePageInPage() {
+  const text = ((document.body && document.body.innerText) || "").slice(0, 3000);
+  const anchors = Array.from(document.querySelectorAll("a[href]"));
+  return {
+    title: document.title,
+    at: location.href.slice(0, 120),
+    anchors: anchors.length,
+    absolute: anchors.filter((a) => /^https?:/i.test(a.getAttribute("href") || "")).length,
+    h3s: document.querySelectorAll("h3").length,
+    prices: (text.match(/\$\s?\d[\d,]*(?:\.\d{2})?/g) || []).length,
+    challenge: /unusual traffic|not a robot|i'm not a robot|captcha|verify (?:it's )?you|before you continue|are you a human|sorry\.\.\./i.test(
+      text + " " + document.title
+    ),
+    firstHrefs: anchors.slice(0, 6).map((a) => (a.getAttribute("href") || "").slice(0, 70)),
+    textStart: text.slice(0, 220).replace(/\s+/g, " "),
+  };
+}
+
+async function probeTab(tabId, label) {
+  try {
+    const frames = await chrome.scripting.executeScript({ target: { tabId }, func: describePageInPage });
+    const d = frames && frames[0] && frames[0].result;
+    if (!d) return;
+    console.warn(
+      `[MP][tab] ${label}: page says — ${d.challenge ? "CHALLENGE/CONSENT PAGE" : "looks like ordinary content"}` +
+        ` | title="${d.title}" | ${d.anchors} links (${d.absolute} absolute) | ${d.h3s} h3 | ${d.prices} prices`,
+      d
+    );
+  } catch (e) {
+    console.warn(`[MP][tab] ${label}: probe failed:`, (e && e.message) || e);
+  }
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function webSearch(query, bare) {
+  // A real tab first — see above; the scriptable endpoints mostly don't answer
+  // any more, and the ones that do can't be relied on.
+  if (await tabSearchEnabled()) {
+    const links = await tabSearch(query);
+    if (links.length) return links;
+    console.warn(`[MP][tab] nothing for "${query}" — falling back to the HTML endpoints`);
+  }
+
   for (const eng of SEARCH_ENGINES) {
     try {
       const { html, status } = await fetchHtmlLimited(eng.url(query), {
@@ -874,7 +1530,10 @@ async function webSearch(query) {
         credentials: "omit",
       });
       if (status >= 400) continue;
-      const links = parseSearchLinks(html).slice(0, WEB_LINKS_PER_QUERY);
+      // Unsliced: discoverOnWeb() drops the already-covered stores first, so
+      // taking the top WEB_LINKS_PER_QUERY here would cap the list at whatever
+      // survives out of the first eight rather than at eight useful links.
+      const links = parseSearchLinks(html);
       if (links.length) {
         console.log(`[MP][web] ${eng.key} "${query}" → ${links.length} links`);
         return links;
@@ -882,6 +1541,14 @@ async function webSearch(query) {
     } catch (e) {
       console.warn(`[MP][web] ${eng.key} failed:`, (e && e.message) || e);
     }
+  }
+  // Seven -site: operators is the sort of query an engine answers with nothing
+  // at all. Coming back empty-handed is worse than coming back with the big
+  // boxes, so ask again without them — the host filter still keeps them from
+  // eating the fetch budget.
+  if (bare && bare !== query) {
+    console.warn(`[MP][web] nothing for "${query}" — retrying without the exclusions`);
+    return webSearch(bare);
   }
   console.warn(`[MP][web] no engine returned links for "${query}"`);
   return [];
@@ -918,6 +1585,15 @@ function resolveResultUrl(href) {
     const decoded = base64UrlDecode(bing[1]);
     if (decoded) url = decoded;
   }
+
+  // Google: /url?q=<target> for organic links it doesn't hand over directly,
+  // and /aclk?...&adurl=<target> for sponsored ones. Without this the target is
+  // a google.com URL, which NOT_A_STORE then throws away — so a result that was
+  // found, and is a real store, disappears anyway.
+  const goog = url.match(/^https?:\/\/(?:www\.)?google\.[a-z.]+\/(?:url|aclk)\?/i)
+    ? url.match(/[?&](?:q|url|adurl)=([^&]+)/)
+    : null;
+  if (goog) url = safeDecode(goog[1]);
 
   if (!/^https?:\/\//i.test(url)) return null;
   let host;
@@ -1133,6 +1809,13 @@ const STORE_NAMES = {
   bestbuy: "Best Buy",
   lowes: "Lowe's",
   ebay: "eBay",
+  solostove: "Solo Stove",
+  dickssportinggoods: "Dick's Sporting Goods",
+  rei: "REI",
+  acehardware: "Ace Hardware",
+  tractorsupply: "Tractor Supply",
+  williams: "Williams Sonoma",
+  bbqguys: "BBQGuys",
 };
 
 function storeKey(host) {

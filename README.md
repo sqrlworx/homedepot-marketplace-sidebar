@@ -130,14 +130,71 @@ product. Three things guard against it:
 
 **Open-web discovery** is what makes arbitrary retailers work, and it needs no
 per-site code: real product pages describe themselves in a machine-readable way.
-The worker searches the web (DuckDuckGo, falling back to Bing), unwraps the
-engine's redirect links, fetches each result, and reads schema.org `Product`
-JSON-LD, OpenGraph `product:` tags, or microdata. Shopify, BigCommerce,
+The worker searches the web, fetches each result, and reads schema.org `Product`
+JSON-LD, OpenGraph `product:` tags, or microdata.
+
+**Google Shopping is read from the same tab**, and it's the most direct source
+there is: each result already names the merchant and the price, so nothing has
+to be fetched or parsed from a retailer's own site. Most tiles link to Google's
+own product page rather than to the store, so the merchant is taken from the
+tile's text and keyed the same way a domain would be (`"Solo Stove"` →
+`solostove`), which is what lets it collapse into the same row as
+`solostove.com`. A tile that *does* link out but fails the link filters is
+dropped rather than re-admitted under its merchant name — that filter is what
+keeps foreign storefronts and their non-USD prices out. That matters because the
+fetch is the step that fails — a direct-to-consumer brand is usually behind a
+bot check — so the shopping pass is often the only way the manufacturer's price
+appears at all.
+
+**The search runs in a background tab.** The engines' scriptable endpoints have
+stopped being usable: DuckDuckGo's HTML and lite endpoints answer a scripted
+request with a challenge page (HTTP 202, no results), and Bing returns HTTP 200
+with the correct `<title>` and an empty results shell — the worse failure of the
+two, because nothing downstream can tell it apart from "no matches". Between
+them the open-web path contributes nothing and the sidebar falls back to the
+seven fixed stores every time. A tab isn't scriptable traffic, though — it's the
+browser, with your session and a real fingerprint — so the search works there.
+The worker opens one unfocused tab, reads the results out with
+`chrome.scripting`, reuses that same tab for the remaining queries (serialized,
+so your tab strip doesn't fill up), and closes it as soon as the last queued
+read comes back — tracked with a counter rather than a timer, because the
+service worker can be shut down the moment the work is done and a timer that
+never fires would leave the tab open for good. Two empty searches in a row and it stands down for two
+minutes, falling back to the HTML endpoints — a cooldown, not a latch, because a
+service worker can outlive a bad patch by a whole browsing session and a latched
+flag would take Google Shopping down with it. Every reason the tab is skipped
+(stood down, switched off, API missing) is logged: silence there reads
+downstream as "Shopping found nothing", which is a completely different
+diagnosis from "we never asked". Turn it off in the
+options page and only the seven fixed stores are searched. **The searches go
+through your normal Google session**, so they show up in your Google history. Shopify, BigCommerce,
 Salesforce Commerce, Magento and every major retail platform emit at least one.
 Pages carrying none are almost never product pages, which conveniently discards
-the buying guides and listicles a web search also returns. The model is asked for
-the manufacturer's own domain so we can run a targeted `site:` search too —
-brands are often outranked by resellers.
+the buying guides and listicles a web search also returns.
+
+**The web budget is spent only where it can add something.** The seven fixed
+stores are searched on every query, and a web result from one of them is keyed
+into that store's existing row — so fetching an Amazon page found by search adds
+no row, it just burns one of the slots that could have surfaced a retailer we
+don't have. So the plain query asks the engine to skip them (`-site:`), and any
+that slip through are dropped before anything is fetched. Alongside it run a
+`site:` search for the manufacturer's own storefront and for the specialty
+retailers identification named — brands are routinely outranked by their own
+resellers. Those domains are the *model's* guess, though, so they're subordinate
+to evidence: Google Shopping runs first and names the merchants that demonstrably
+sell the item, and any guessed domain it has already priced is dropped rather
+than searched again. Since both queue behind the same single tab, ordering them
+that way costs nothing and can only reduce the number of searches. There is deliberately **no search on the model number**, tempting as
+it is: that's the field identification is most likely to invent, and searching
+it before `corroborates()` has tested it doesn't come back empty, it comes back
+with the wrong product line's pages, which then become the evidence the
+verification pass reasons over. The model still reaches the search inside the
+exact-item query, where a wrong one degrades to a keyword rather than a demand.
+The per-query results are merged
+round-robin, so each search gets a fair share of the fetch budget rather than
+the first one taking it all. A query the engine answers with nothing is retried
+without the exclusions, since the big boxes are still better than an empty
+sidebar.
 
 **Fixed store searches** run alongside. Store search pages differ wildly — some
 are server-rendered HTML, some a JSON blob — so rather than seven fragile DOM
@@ -156,6 +213,18 @@ search collapses into the same row as that store's own search result.
   and the retailers have no free product-search API, so both directions scrape
   pages that change often. Parsing may break; when it does, the sidebar always
   falls back to a plain "search here" link per store, which always works.
+- **Most manufacturers won't be read, only linked.** A direct-to-consumer brand
+  is usually behind a bot check that a scripted fetch can't pass — solostove.com
+  answers one with a Cloudflare "Managed Challenge" (HTTP 403) — and the page is
+  fetched with `credentials: "omit"`, so the clearance cookie your browser
+  already holds isn't presented. Rather than dropping the page silently, the
+  store shows up in the card as a link to the deepest page found for it, with
+  the reason in its tooltip. The same applies when the page loads fine but
+  publishes no machine-readable price — common on client-rendered storefronts —
+  as long as it's a store identification named: there, an unreadable page means
+  the right page in the wrong format, not a listicle. Sending cookies to third-party product pages would fix the
+  price but hand your session to every site a search turns up, which is a
+  trade this doesn't make by default.
 - Retailers actively defend against scripted requests. A store that answers with
   a bot check contributes no prices — it just shows up as a search link. Amazon
   and eBay parse most reliably; Target and Walmart render results client-side and
@@ -179,9 +248,17 @@ search collapses into the same row as that store's own search result.
   and any page declaring a non-USD `priceCurrency` is dropped — which also
   catches foreign locales hosted on a `.com`. To target another country, change
   those three together.
-- Only the **exact-item** query goes to the web. A category query ("gas grill")
-  returns buying guides rather than products, so alternatives come from the fixed
-  store searches instead.
+- Only the **exact-item** query goes to the open web: a category query ("gas
+  grill") returns buying guides rather than products. Google Shopping runs for
+  both, though — it answers a category query with real priced products, which is
+  what the "Similar items" section wants and what the fixed seven can't supply.
+- **Without an API key there is no category query at all**, so "Similar items"
+  is thin. The last two tokens of a seller's title are as likely to be "19 5" as
+  "fire pit", and a wrong category doesn't produce worse alternatives, it
+  produces a section full of whatever the stores return for "19 5". The same
+  goes for identifying a successor model: nothing token-based can know that one
+  product line replaced another under a different name, because the two titles
+  share no words. That judgment needs the model.
 - Photo identification is only as good as the photo. Low-confidence guesses are
   labelled as such in the card, and a corrected one says what changed — but the
   correction is itself a model judgment and can be wrong. Edit the query box if
@@ -192,9 +269,17 @@ search collapses into the same row as that store's own search result.
 - You must be **logged into Facebook** for the retail direction; otherwise the
   fetch returns a login page and the sidebar tells you so. Marketplace results
   are location-based (tied to your FB account).
-- On Facebook the sidebar **overlays** the page rather than docking it: FB's
-  layout is built from full-viewport fixed elements, so shrinking the document
-  doesn't reflow it. On retailers it docks and the page reflows to the left.
+- The sidebar **docks** rather than overlays: the document is shrunk by the
+  panel's width, so the page reflows into the strip to its left. That alone is
+  enough on the retailers, but not on Facebook, whose top bar and full-screen
+  listing overlay are `position: fixed` and therefore sized against the viewport,
+  which shrinking the document doesn't touch. So `dockFixedElements()` hit-tests
+  a column of points down the strip every 500 ms and tags whatever fixed boxes
+  answer, and CSS pulls those clear too — asking the page what's actually under
+  the panel, rather than matching Facebook's generated class names. A fixed box
+  that is neither full-width nor anchored to the right edge (a centred one,
+  say) can't be nudged this way and would still sit under the panel; none of
+  Facebook's current chrome is shaped like that.
 - Marketplace mode is injected on `facebook.com/marketplace/*` only. Browsing
   Marketplace and clicking into a listing works; SPA-navigating in from the News
   Feed won't, since Chrome decides injection from the URL at load time.
@@ -218,9 +303,17 @@ search collapses into the same row as that store's own search result.
   `background.js` — a search URL and a product-URL regex is all a store needs.
   Most stores don't need an entry at all; web discovery finds them.
 - How many web results get fetched, and how deeply: `WEB_LINKS_PER_QUERY`,
-  `WEB_MAX_PAGES`, `PAGE_MAX_BYTES` in `background.js`.
-- Search engines and result-link unwrapping: `SEARCH_ENGINES`,
-  `resolveResultUrl()`. Hosts that are never a store: `NOT_A_STORE`.
+  `WEB_MAX_QUERIES`, `WEB_MAX_PAGES`, `PAGE_MAX_BYTES` in `background.js`.
+- Which searches are run to reach past the fixed stores: `webQueries()`. What
+  counts as already covered (and so gets excluded and filtered out):
+  `COVERED_DOMAINS` / `isCoveredStore()`, both derived from `SHOPS`.
+- Searching in a tab: `tabScrape()` / `tabSearch()` / `shoppingSearch()`, the
+  injected readers `scrapeResultsInPage()` / `scrapeShoppingInPage()`, and the
+  `TAB_*` constants.
+- Bucketing without an API key: `scoreOffers()` in `content.js` (including the
+  maker's-own-storefront rule) and `heuristicIdentify()` in `background.js`. The fallback engines and result-link unwrapping:
+  `SEARCH_ENGINES`, `resolveResultUrl()`. Hosts that are never a store:
+  `NOT_A_STORE`. Pages found but unreadable: `noteBlocked()`.
 - Reading a product off an arbitrary page: `productFromPage()` and its
   JSON-LD / OpenGraph / microdata readers.
 - Store display names: the `STORE_NAMES` map (everything else is derived from
@@ -233,5 +326,8 @@ search collapses into the same row as that store's own search result.
   `llmRank()` in `background.js`.
 - When a guessed model is treated as unsupported: `corroborates()` in
   `content.js`.
+- How the page is pushed aside for the panel: `setDocked()` /
+  `dockFixedElements()` in `content.js`, and the `html.hd-mp-docked` rules in
+  `sidebar.css`.
 - Styling: `sidebar.css`.
 - `icons/icon128.png` is a generated placeholder — swap in your own.
