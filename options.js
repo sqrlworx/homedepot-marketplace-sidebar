@@ -2,19 +2,23 @@
 
 const KEY = "mp_apiKey";
 const MODEL = "mp_model";
+const TAB_SEARCH = "mp_tabSearch";
 
 function load() {
-  chrome.storage.local.get([KEY, MODEL], (cfg) => {
+  chrome.storage.local.get([KEY, MODEL, TAB_SEARCH], (cfg) => {
     document.getElementById("apiKey").value = cfg[KEY] || "";
     document.getElementById("model").value =
       cfg[MODEL] || "llama4-maverick-17b-128e-instruct";
+    // Unset means on: without it, web discovery finds nothing at all.
+    document.getElementById("tabSearch").checked = cfg[TAB_SEARCH] !== false;
   });
 }
 
 function save() {
   const apiKey = document.getElementById("apiKey").value.trim();
   const model = document.getElementById("model").value;
-  chrome.storage.local.set({ [KEY]: apiKey, [MODEL]: model }, () => {
+  const tabSearch = document.getElementById("tabSearch").checked;
+  chrome.storage.local.set({ [KEY]: apiKey, [MODEL]: model, [TAB_SEARCH]: tabSearch }, () => {
     const status = document.getElementById("status");
     status.textContent = "Saved ✓";
     setTimeout(() => (status.textContent = ""), 2000);

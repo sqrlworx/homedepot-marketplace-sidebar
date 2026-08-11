@@ -3,7 +3,7 @@
   "name": "Retail ↔ Marketplace Finder",
   "version": "0.3.0",
   "description": "On a retail product page, find the same item on Facebook Marketplace. On a Marketplace listing, identify the item from its photo and find it for sale new online.",
-  "permissions": ["storage"],
+  "permissions": ["storage", "scripting"],
   "host_permissions": ["https://*/*"],
   "background": {
     "service_worker": "background.js"

@@ -44,8 +44,30 @@
  * left. The panel is fixed at right:0, so it sits exactly in the freed strip.
  * Kept in sync with .hd-mp-open by togglePanel() in content.js. */
 html.hd-mp-docked {
-  margin-right: min(360px, 92vw) !important;
+  --hd-mp-w: min(360px, 92vw);
+  margin-right: var(--hd-mp-w) !important;
   transition: margin-right 0.2s ease;
+}
+
+/* Shrinking the document only moves what's in normal flow. Facebook builds its
+ * chrome out of position:fixed boxes — the top bar, and the full-screen overlay
+ * a listing opens in — which are sized against the viewport and so keep running
+ * underneath the panel. dockFixedElements() in content.js finds the fixed boxes
+ * that actually overlap the panel's strip and tags them:
+ *
+ *   .hd-mp-fixed       nudge a box clear of the strip (works for right-anchored
+ *                      and auto-width boxes)
+ *   .hd-mp-fixed-wide  ... and narrow one that spans the whole viewport
+ *
+ * `100%` on a fixed box resolves against the viewport rather than the shrunken
+ * <html>, which is exactly what's wanted here. Nesting doesn't compound: a fixed
+ * box is placed against the viewport, so an already-shifted ancestor doesn't
+ * move it again. */
+html.hd-mp-docked .hd-mp-fixed {
+  margin-right: var(--hd-mp-w) !important;
+}
+html.hd-mp-docked .hd-mp-fixed-wide {
+  width: calc(100% - var(--hd-mp-w)) !important;
 }
 
 #hd-mp-sidebar * { box-sizing: border-box; }
